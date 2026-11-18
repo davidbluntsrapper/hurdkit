@@ -74,6 +74,14 @@ for spec in "${specs[@]}"; do
     mksquashfs "$WORK/src-$kind" "$WORK/img/$name.img" -pf "$WORK/src-$kind.pseudo" $opts
     [[ $kind == main ]] && VARIANTS+=("$name")
 done
+# 2000 names for one file: lookups of hard links hold the directory and
+# lock a node that many names share.
+mkdir -p "$WORK/src-links/a"
+echo "one file, 2000 names" > "$WORK/src-links/a/f0"
+for i in $(seq 1 1999); do ln "$WORK/src-links/a/f0" "$WORK/src-links/a/f$i"; done
+# shellcheck disable=SC2086
+mksquashfs "$WORK/src-links" "$WORK/img/links.img" -comp gzip $common
+for k in dirloop unsorted huge; do python3 "$IMAGES" craft $k "$WORK/img/$k.img"; done
 cp "$WORK/img/small.img" "$WORK/img/compressor-99.img"
 python3 "$IMAGES" set-compressor "$WORK/img/compressor-99.img" 99
 python3 "$IMAGES" corrupt "$WORK/img/small.img" "$WORK/corrupt"
@@ -91,6 +99,7 @@ for name in "${VARIANTS[@]}" wide xattr small; do
     if linux_mount "$WORK/img/$name.img"; then
         sudo python3 -I "$TOOL" manifest "$WORK/mnt" --full > "$WORK/linux-$name.txt"
         [[ $name == xattr ]] && sudo python3 -I "$TOOL" xattrs "$WORK/mnt" > "$WORK/linux-xattrs.txt"
+        [[ $name == gzip ]] && python3 -I "$TOOL" statvfs-flags "$WORK/mnt" > "$WORK/linux-statvfs.txt"
         [[ $name == gzip ]] && for d in . big-dir; do
             { echo .; echo ..; ls -A "$WORK/mnt/$d"; } | LC_ALL=C sort > "$WORK/linux-list-$(basename "$d").txt"
         done
@@ -131,6 +140,16 @@ if python3 "$TOOL" compare "$WORK/expect-main.txt" "$WORK/unsquashfs.txt" --igno
 else
     fail "squash: oracle: unsquashfs extracts gzip.img as the source tree"
 fi
+# The names a lookup finds in a directory not in strcmp order.  huge.img
+# is not read through Linux: reading its file hangs Linux 7.0's reader in
+# D state.
+if linux_mount "$WORK/img/unsorted.img"; then
+    # shellcheck disable=SC2046
+    python3 -I "$TOOL" stat-names "$WORK/mnt/d" $(ls -f "$WORK/mnt/d" | grep -vx '\.\.\?') > "$WORK/linux-unsorted.txt"
+    sudo umount "$WORK/mnt"
+else
+    : > "$WORK/linux-unsorted.txt"
+fi
 for name in lzma compressor-99; do
     if linux_mount "$WORK/img/$name.img"; then
         sudo umount "$WORK/mnt"
@@ -162,7 +181,9 @@ gmnt() { echo "/mnt/sq-$1"; }
 # so its error messages start with "$GT: " whatever the host file is.
 echo "squashfs-test: copying the translator and the test tools"
 mnts=""
-for m in "${VARIANTS[@]}" wide xattr lzma compressor-99 "${CORRUPT[@]}"; do mnts+=" $(gmnt "$m")"; done
+for m in "${VARIANTS[@]}" wide xattr lzma compressor-99 links dirloop unsorted huge "${CORRUPT[@]}"; do
+    mnts+=" $(gmnt "$m")"
+done
 cp "$SQUASHFS_BIN" "$WORK/squashfs.static"
 if ! { g "for m in$mnts; do settrans -fg \$m 2>/dev/null; done; rm -rf /tmp/sq-fuzz; true" \
        && put "$WORK/squashfs.static" "$TOOL" "$WORK/fs_probe"; }; then
@@ -219,7 +240,8 @@ GZIP_CHECKS=("lookups: a missing name gives ENOENT, .. at the root leaves the mo
              "readdir (readdir1) of big-dir lists each entry once" "readdir (seekdir 7) of big-dir lists each entry once"
              "exec a static binary from the image" "exec a script from the image"
              "mmap reads the same bytes as Linux" "writes refused with EROFS"
-             "8 parallel readers get the single reader's manifest")
+             "8 parallel readers get the single reader's manifest"
+             "statvfs gives the flags Linux gives")
 if [[ " ${PASSES[*]} " != *"squash: gzip: mount"* ]]; then
     for c in "${GZIP_CHECKS[@]}"; do fail "squash: $c (gzip.img not mounted)"; done
 else
@@ -264,6 +286,12 @@ else
     else
         fail "squash: writes refused with EROFS ($(echo "$out" | tr '\n' ' '))"
     fi
+    got=$(g "python3 /tmp/fs_image_test.py statvfs-flags $M" 2>&1 || true)
+    if [[ -s "$WORK/linux-statvfs.txt" && "$got" == "$(cat "$WORK/linux-statvfs.txt")" ]]; then
+        pass "squash: statvfs gives the flags Linux gives"
+    else
+        fail "squash: statvfs gives the flags Linux gives (Linux: $(cat "$WORK/linux-statvfs.txt"), translator: $got)"
+    fi
     echo "squashfs-test: 8 parallel readers"
     if g "for i in 1 2 3 4 5 6 7 8; do python3 /tmp/fs_image_test.py manifest $M --full > /tmp/par-\$i.txt & done; wait" \
         && get "/tmp/par-*.txt" "$WORK/"; then
@@ -306,6 +334,83 @@ fi
 refused_cleanly() {
     [[ "$1" != *"rc=0"* && "$1" == *"$GT: "* && "$1" != *"Assertion"* && "$1" != *"signal"* ]]
 }
+# Images where a lookup must not hang the translator: each is checked
+# under its own time bound, and the mount must answer afterwards.
+# alive NAME: the mount of NAME still answers a readdir.
+alive() { GUEST_TIMEOUT=30 g "timeout 20 ls $(gmnt "$1") >/dev/null"; }
+# 16 processes stat the 2000 names of one file: on a translator that
+# locks a child, then its directory again, two of them soon wait on each
+# other (within seconds, LINK_SECS 60 leaves a margin).
+LINK_SECS=${LINK_SECS:-60}
+echo "squashfs-test: hard links: $LINK_SECS s of parallel lookups"
+if mount_image links; then
+    out=$(GUEST_TIMEOUT=$((LINK_SECS + 60)) g "python3 /tmp/fs_image_test.py stat-storm $LINK_SECS 16 $(gmnt links)/a/f{0..1999}" 2>&1 || true)
+    if [[ "$out" == "stats="*" errors={}" ]] && alive links; then
+        pass "squash: hard links: 16 processes of lookups for ${LINK_SECS}s, and the mount still answers ($out)"
+        unmount_image links
+    else
+        fail "squash: hard links: 16 processes of lookups for ${LINK_SECS}s, and the mount still answers (got: $(echo "$out" | tail -1))"
+    fi
+else
+    fail "squash: hard links: 16 processes of lookups (links.img not mounted)"
+fi
+
+# dirloop.img: a holds b, which holds a again.  Linux gives ELOOP for
+# a/b/a; the translator must refuse the image or give EIO for it, and
+# keep answering while processes walk the loop.
+echo "squashfs-test: a directory loop"
+loop=$(gmnt dirloop)
+out=$(mount_image dirloop 2>&1; echo "rc=$?")
+if [[ "$out" == *"rc=0"* ]]; then
+    out=$(GUEST_TIMEOUT=120 g "python3 /tmp/fs_image_test.py stat-names $loop/a/b a; python3 /tmp/fs_image_test.py stat-storm 30 16 $loop/a $loop/a/b $loop/a/b/a $loop/a/b/a/b $loop/a/b/.. $loop/a/b/a/.. $loop/f" 2>&1 || true)
+    if [[ "$out" == $'a\tEIO'* && "$out" == *"stats="* ]] && alive dirloop; then
+        pass "squash: a directory loop gives EIO, and 16 processes walking it do not hang the mount"
+        unmount_image dirloop
+    else
+        fail "squash: a directory loop gives EIO, and 16 processes walking it do not hang the mount (got: $(echo "$out" | tr '\n\t' '  '))"
+    fi
+elif refused_cleanly "$out"; then
+    pass "squash: a directory loop: the image is refused"
+else
+    fail "squash: a directory loop gives EIO or is refused (got: $(echo "$out" | tr '\n' ' '))"
+fi
+
+# unsorted.img: a listing not in strcmp order.  Linux's lookup stops only
+# at an entry whose first byte sorts after the name's: the translator must
+# find the same names.
+echo "squashfs-test: a directory not in strcmp order"
+if mount_image unsorted; then
+    # shellcheck disable=SC2046
+    got=$(g "python3 /tmp/fs_image_test.py stat-names $(gmnt unsorted)/d $(cut -f1 "$WORK/linux-unsorted.txt" | tr '\n' ' ')" 2>&1 || true)
+    if [[ -s "$WORK/linux-unsorted.txt" && "$got" == "$(cat "$WORK/linux-unsorted.txt")" ]]; then
+        pass "squash: a directory not in strcmp order: the names Linux finds are found"
+    else
+        fail "squash: a directory not in strcmp order: the names Linux finds are found (Linux: $(tr '\n\t' ' =' < "$WORK/linux-unsorted.txt"); translator: $(echo "$got" | tr '\n\t' ' ='))"
+    fi
+    unmount_image unsorted
+else
+    fail "squash: a directory not in strcmp order (unsorted.img not mounted)"
+fi
+
+# huge.img: a file claiming 2^62 bytes with a block list of one entry.
+# The image has no room for the list that size needs, so the file must
+# give EIO (or the image be refused), within a time bound.
+echo "squashfs-test: a file claiming 2^62 bytes"
+out=$(mount_image huge 2>&1; echo "rc=$?")
+if [[ "$out" == *"rc=0"* ]]; then
+    out=$(GUEST_TIMEOUT=90 g "python3 /tmp/fs_image_test.py stat-names $(gmnt huge) huge; timeout 60 dd if=$(gmnt huge)/huge of=/dev/null bs=1M count=64 2>&1 | tail -1" 2>&1 || true)
+    if [[ "$out" == $'huge\tEIO'* ]] && alive huge; then
+        pass "squash: a file claiming 2^62 bytes gives EIO"
+        unmount_image huge
+    else
+        fail "squash: a file claiming 2^62 bytes gives EIO (got: $(echo "$out" | tr '\n\t' '  '))"
+    fi
+elif refused_cleanly "$out"; then
+    pass "squash: a file claiming 2^62 bytes: the image is refused"
+else
+    fail "squash: a file claiming 2^62 bytes gives EIO or is refused (got: $(echo "$out" | tr '\n' ' '))"
+fi
+
 for spec in "lzma lzma" "compressor-99 99"; do
     read -r name word <<< "$spec"
     out=$(mount_image "$name" 2>&1; echo "rc=$?")

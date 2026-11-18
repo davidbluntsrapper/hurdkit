@@ -18,6 +18,7 @@
                                            write N copies of IMG with random
                                            bytes changed, fuzz-NNN.img
   squashfs_images.py set-compressor IMG ID patch the superblock compressor id
+  squashfs_images.py craft KIND IMG        write a hand-made image (CRAFTED)
 
 Owners, device nodes and xattrs come from mksquashfs pseudo definitions
 (-pf DIR.pseudo), so no step needs root.  The definitions and the
@@ -354,6 +355,104 @@ def set_compressor(image, cid):
         f.write(struct.pack("<H", cid))
 
 
+class _Crafted:
+    """A small image written field by field: every inode in one stored
+    (uncompressed) metadata block, every listing in another, so that an
+    image no tool would write can be described in a few lines."""
+
+    def __init__(self):
+        self.inodes = bytearray()
+        self.listings = bytearray()
+        self.count = 0
+
+    def _inode(self, itype, ino, body, mode):
+        ref = len(self.inodes)
+        self.inodes += struct.pack("<HHHHII", itype, mode, 0, 0, MTIME, ino) + body
+        self.count += 1
+        return ref
+
+    def file(self, ino, size=6, blocks=(6 | 1 << 24,)):
+        """A file whose data is uncompressed blocks at the start of the
+        data area; a size past 4 GiB makes it an extended inode."""
+        if size >> 32:
+            body = struct.pack("<QQQIIII", SB.size, size, 0, 1, 0xFFFFFFFF, 0, 0xFFFFFFFF)
+            itype = 9
+        else:
+            body = struct.pack("<IIII", SB.size, 0xFFFFFFFF, 0, size)
+            itype = 2
+        return self._inode(itype, ino, body + struct.pack(f"<{len(blocks)}I", *blocks), 0o644)
+
+    def dir(self, ino, parent):
+        """A directory with an empty listing until list() gives it one."""
+        return self._inode(1, ino, struct.pack("<IIHHI", 0, 2, 3, 0, parent), 0o755)
+
+    def list(self, dref, entries):
+        """Give directory DREF the listing ENTRIES, (name, ino, type, ref),
+        in the order given, as one run."""
+        start = len(self.listings)
+        base = entries[0][1]
+        self.listings += struct.pack("<III", len(entries) - 1, 0, base)
+        for name, ino, itype, ref in entries:
+            self.listings += struct.pack("<HhHH", ref, ino - base, itype, len(name) - 1) + name.encode()
+        nlink = 2 + sum(itype == 1 for _, _, itype, _ in entries)
+        struct.pack_into("<IIHHI", self.inodes, 16 + dref, 0, nlink,
+                         len(self.listings) - start + 3, start,
+                         struct.unpack_from("<I", self.inodes, dref + 28)[0])
+
+    def write(self, path, root, data=b"hello\n"):
+        stored = lambda b: struct.pack("<H", len(b) | 0x8000) + bytes(b)
+        out = bytearray(SB.size) + data
+        itab = len(out)
+        out += stored(self.inodes)
+        dtab = len(out)
+        out += stored(self.listings)
+        idblock = len(out)
+        out += stored(struct.pack("<I", 0))
+        idtab = len(out)
+        out += struct.pack("<Q", idblock)
+        none = 0xFFFFFFFFFFFFFFFF
+        out[:SB.size] = SB.pack(0x73717368, self.count, MTIME, 4096, 0, 1, 12, 0, 1, 4, 0,
+                                root, len(out), idtab, none, itab, dtab, none, none)
+        out += bytes(-len(out) % 4096)
+        with open(path, "wb") as f:
+            f.write(out)
+
+
+def craft(kind, path):
+    """Write the hand-made image KIND to PATH (see CRAFTED)."""
+    c = _Crafted()
+    if kind == "dirloop":
+        f = c.file(4)
+        a = c.dir(2, 1)
+        b = c.dir(3, 2)
+        root = c.dir(1, 5)
+        c.list(root, [("a", 2, 1, a), ("f", 4, 2, f)])
+        c.list(a, [("b", 3, 1, b)])
+        c.list(b, [("a", 2, 1, a)])
+    elif kind == "unsorted":
+        n = len(UNSORTED)
+        files = [c.file(ino) for ino in range(1, n + 1)]
+        d = c.dir(n + 1, n + 2)
+        root = c.dir(n + 2, n + 3)
+        c.list(d, [(name, i + 1, 2, files[i]) for i, name in enumerate(UNSORTED)])
+        c.list(root, [("d", n + 1, 1, d)])
+    elif kind == "huge":
+        f = c.file(2, size=1 << 62, blocks=(0,))
+        root = c.dir(1, 3)
+        c.list(root, [("huge", 2, 2, f)])
+    else:
+        raise SystemExit(f"craft: unknown kind {kind}")
+    c.write(path, root)
+
+
+# The hand-made images: dirloop, where directory a holds b and b holds a
+# again; unsorted, whose directory d lists UNSORTED in that order, which
+# is not strcmp order; huge, whose file claims 2^62 bytes and lists one
+# block.
+CRAFTED = ("dirloop", "unsorted", "huge")
+UNSORTED = ("a1", "b2", "b10", "b1", "c3", "b4")
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else ""
     if cmd == "tree" and len(argv) == 5:
@@ -371,6 +470,8 @@ def main(argv):
         fuzz(argv[2], argv[3], argv[4], int(argv[5]))
     elif cmd == "set-compressor" and len(argv) == 4:
         set_compressor(argv[2], int(argv[3]))
+    elif cmd == "craft" and len(argv) == 4:
+        craft(argv[2], argv[3])
     else:
         print(__doc__, file=sys.stderr)
         return 2

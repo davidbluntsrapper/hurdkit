@@ -247,6 +247,7 @@ checkout. The other variables are the ones in the table above
 | `FUZZ_SEED` | `1` | Seed of the fuzz images; copy k of seed s is the same on every run |
 | `FUZZ_COUNT` | `200` | Number of fuzz images |
 | `SQUASHFS_BIN` | `~/src/squashfs/squashfs.static` | Script only: the binary used as the translator; the target sets it to `SQUASHFS_DIR/squashfs.static` |
+| `LINK_SECS` | `60` | Script only: how long the hard-link check runs its 16 processes of lookups |
 | `CROSS_CC` | `~/opt/x86_64-gnu/bin/x86_64-gnu-gcc` | Script only: compiler for `scripts/fs_probe.c` |
 
 To check the harness itself, or to run it without a build, call the
@@ -280,6 +281,13 @@ so the two cannot disagree.
 | `wide` | 72173 inodes in 71 directories, 4201 distinct ids (the id table spans three metadata blocks), and a 5 GiB sparse file with data across the 4 GiB boundary | `wide.img` (gzip) |
 | `xattr` | `user.*`, `trusted.*` and `security.*` xattrs on files and a directory, a 6148-byte value, 120 xattrs on one file, two files with the same set, an empty value | `xattr.img` (xz) |
 | `small` | A few files, a compressible multi-block file, one fragment, three ids | `small.img` (gzip), the source of the corrupt and fuzz images; `lzma.img` (compressor id 2, which Linux does not support); `compressor-99.img` |
+| `links` | One file with 2000 names in one directory | `links.img` (gzip) |
+
+`squashfs_images.py craft KIND IMG` writes three images by hand, field by
+field, that no tool writes: `dirloop.img`, where directory `a` holds `b`
+and `b` holds `a` again; `unsorted.img`, whose directory `d` lists
+`a1 b2 b10 b1 c3 b4` in that order, which is not strcmp order; and
+`huge.img`, whose file claims 2^62 bytes and lists one block.
 
 ### What the squashfs test checks
 
@@ -301,7 +309,12 @@ Every check name starts with `squash:`.
 | `mmap reads the same bytes as Linux` | The sha256 of five files read through `mmap` equals Linux's |
 | `writes refused with EROFS` | Create, open for write, truncate, unlink, chmod, chown, utime, rename, link, symlink, mkdir, rmdir and mkfifo all fail with EROFS |
 | `8 parallel readers get the single reader's manifest` | Eight full manifests taken at once all equal the one taken alone, so a concurrency bug shows apart from a reader bug |
+| `statvfs gives the flags Linux gives` | `os.statvfs` of the gzip mount sets the same `ST_*` flags, by name, as on Linux (`ST_RDONLY ST_RELATIME`; Linux and the Hurd number them differently) |
 | `xattr: user, trusted and security xattrs match Linux` | `KNOWN` while it fails: glibc's `hurd/xattr.c` passes only `gnu.*` names. `fs_probe xattrs` (glibc `llistxattr` and `lgetxattr`, as any Hurd program sees them) must list the same names, lengths and sha256 of values as Linux, for every entry of the image |
+| `hard links: 16 processes of lookups for Ns, and the mount still answers` | 16 processes `lstat` random names of `links.img` for `LINK_SECS` seconds without an error, under a time bound, and a `ls` of the mount then answers. A translator that locks the child and then the directory again, against the order of libdiskfs's name cache, wedges within seconds |
+| `a directory loop gives EIO, and 16 processes walking it do not hang the mount` | `a/b/a` of `dirloop.img` gives EIO (Linux gives ELOOP), 16 processes `lstat` paths through the loop and their `..` for 30 s, and the mount then answers; refusing the image passes too |
+| `a directory not in strcmp order: the names Linux finds are found` | For each name of `unsorted.img`'s `d`, a lookup finds it or gives the same errno as on Linux, whose lookup stops only at an entry whose first byte sorts after the name's |
+| `a file claiming 2^62 bytes gives EIO` | `lstat` of `huge.img`'s file gives EIO within a time bound, and the mount then answers; refusing the image passes too. Linux is not asked: reading that file hangs Linux 7.0's reader |
 | `refuses lzma.img, naming the compressor`, `refuses compressor-99.img, ...` | The mount fails with the translator's own message, which names `lzma` or `99` |
 | `corrupt NAME.img: at least as strict as Linux` | See below |
 | `the gzip mount still serves after the corrupt images` | The first mount still answers |
@@ -381,6 +394,9 @@ calls the library. To move to a new release, change the `*_VER` and
   of entries inside it, and mksquashfs then ignores it.
 - mksquashfs cannot read a file the user cannot read. Give the source
   file a readable mode and set the real mode with a pseudo `M`.
+- Do not loop-mount `huge.img` on the host and read its file: Linux 7.0
+  serves the 2^62-byte size, and a `dd` of its first MiB stays in D state
+  (the reader waits on a page that never completes).
 - mksquashfs pads the image to 4 KiB, so a truncation must cut
   `bytes_used`, not the file length, or it removes only padding.
 - The guest's Python (3.14) reads at most 1024 bytes in `os.readlink`
