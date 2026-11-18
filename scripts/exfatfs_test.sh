@@ -4,10 +4,12 @@
 #
 #   make exfatfs-test                  # control (fatfs) + exfatfs
 #   make exfatfs-test FS=fat           # control only
-#   make exfatfs-test HURD_TREE=DIR    # translators from another Hurd tree
+#   make exfatfs-test HURD_TREE=DIR    # fatfs from another Hurd tree
+#   make exfatfs-test EXFATFS_DIR=DIR  # exfatfs from another checkout
 #
-# Takes fatfs.static and exfatfs.static from TRANSLATOR_DIR (the
-# fs-translators build directory), makes a FAT image (mtools) and an exFAT
+# Takes fatfs.static from TRANSLATOR_DIR (the fs-translators build
+# directory) and exfatfs.static from EXFATFS_STATIC (default:
+# TRANSLATOR_DIR/exfatfs/exfatfs.static), makes a FAT image (mtools) and an exFAT
 # image (mkfs.exfat, filled through the Linux kernel exfat driver, which
 # needs sudo for the loop mount), boots a throwaway overlay of the packages
 # image, mounts each image in the guest with its translator on a file
@@ -92,9 +94,15 @@ rm -rf "$WORK"
 mkdir -p "$WORK/mnt"
 
 bins=()
-for fs in $FS; do bins+=("$TRANSLATOR_DIR/${fs}fs/${fs}fs.static"); done
+for fs in $FS; do
+    if [[ $fs == exfat ]]; then
+        bins+=("${EXFATFS_STATIC:-$TRANSLATOR_DIR/exfatfs/exfatfs.static}")
+    else
+        bins+=("$TRANSLATOR_DIR/${fs}fs/${fs}fs.static")
+    fi
+done
 for f in "${bins[@]}"; do
-    [[ -f "$f" ]] || { echo "exfatfs-test: missing $f (make -C toolchain fs-translators)" >&2; exit 1; }
+    [[ -f "$f" ]] || { echo "exfatfs-test: missing $f (make fs-translators exfatfs)" >&2; exit 1; }
 done
 
 for fs in $FS; do

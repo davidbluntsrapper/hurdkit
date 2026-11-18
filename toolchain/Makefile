@@ -25,7 +25,7 @@ SSH_PORT ?= 2222
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp storeio fs-translators virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp libdiskfs storeio fs-translators exfatfs virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -429,6 +429,30 @@ libirqhelp: hurd mig
 	@echo "=== gate: libirqhelp ==="
 	ls $(PREFIX)/lib/libirqhelp.so $(PREFIX)/include/hurd/irqhelp.h >/dev/null
 
+# libdiskfs and libstore are not installed by the `hurd` stage either.  The
+# standalone exfatfs translator links them from the prefix, with
+# libhurdbugaddr for its --help bug address.  libstore's install includes
+# the libstore_<type>.a archives that select the store types a static
+# filesystem links.  libstore has gunzip and bunzip2 only if zlib and
+# libbz2 are in the prefix when it is configured.
+libdiskfs: hurd mig
+	@if ls $(PREFIX)/lib/libdiskfs.so >/dev/null 2>&1; then \
+	    echo "(skipping: libdiskfs already installed)"; \
+	else \
+	    $(call hurd-configure,$(REPO_ROOT)/3p/hurd,$(BUILD)/hurd-diskfs) && \
+	    for d in libhurdbugaddr libshouldbeinlibc libihash libiohelp libports \
+	             libpager libfshelp libstore libdiskfs; do \
+	        make -C $$d -j$(NPROC) || exit 1; \
+	    done && \
+	    for d in libhurdbugaddr libstore libdiskfs; do \
+	        make -C $$d install || exit 1; \
+	    done; \
+	fi
+	@echo "=== gate: libdiskfs ==="
+	ls $(PREFIX)/lib/libdiskfs.a $(PREFIX)/lib/libstore.a \
+	    $(PREFIX)/lib/libstore_device.a $(PREFIX)/lib/libhurdbugaddr.a \
+	    $(PREFIX)/include/hurd/diskfs.h $(PREFIX)/include/hurd/store.h >/dev/null
+
 # Copy a Hurd source tree and configure the copy out of tree for x86_64-gnu,
 # the way the `hurd` stage does: $(1) is the source tree, $(2) the build
 # directory, and the copy lands in $(2)-src.  Both are recreated on every
@@ -478,17 +502,16 @@ storeio: hurd mig
 # Static libdiskfs translators from HURD_TREE (default: the pinned 3p/hurd),
 # for the filesystem harness (scripts/exfatfs_test.sh).  Static, so they run
 # in the guest whatever Hurd libraries the Debian image ships.  The output
-# is $(BUILD)/hurd-translators/<name>/<name>.static.  The pinned 3p/hurd
-# has fatfs but not yet exfatfs, which comes with hurdkit/hurd's exfatfs
-# change: build exfatfs with HURD_TREE set to a tree that has it.
+# is $(BUILD)/hurd-translators/<name>/<name>.static.  exfatfs is not one of
+# them: it has its own repo and target (`exfatfs`, below).
 HURD_TREE      ?= $(REPO_ROOT)/3p/hurd
-FS_TRANSLATORS ?= fatfs exfatfs
+FS_TRANSLATORS ?= fatfs
 # Checked when make reads this file, so a missing translator stops the
 # build before any stage runs rather than after the configure.
 ifneq ($(filter fs-translators,$(MAKECMDGOALS)),)
 FS_MISSING := $(strip $(foreach t,$(FS_TRANSLATORS),$(if $(wildcard $(abspath $(HURD_TREE))/$(t)/Makefile),,$(t))))
 ifneq ($(FS_MISSING),)
-$(error HURD_TREE=$(abspath $(HURD_TREE)) has no $(FS_MISSING) translator. exfatfs needs a Hurd tree with the exfatfs translator (hurdkit/hurd's exfatfs change, not yet in the pinned 3p/hurd): pass HURD_TREE=<that tree>, or FS=fat to test the fatfs control alone)
+$(error HURD_TREE=$(abspath $(HURD_TREE)) has no $(FS_MISSING) translator)
 endif
 endif
 fs-translators: hurd mig
@@ -500,6 +523,18 @@ fs-translators: hurd mig
 	for t in $(FS_TRANSLATORS); do make -C $$t -j$(NPROC) $$t.static || exit 1; done
 	@echo "=== gate: fs-translators ==="
 	$(call hurd-elf-gate,$(foreach t,$(FS_TRANSLATORS),$(BUILD)/hurd-translators/$(t)/$(t).static))
+
+# The exFAT translator lives in its own repo (exfatfs, the
+# standalone pattern of 3p/9pfs and the virtio drivers) and links libdiskfs
+# and libstore from the prefix.  EXFATFS_DIR selects which checkout is
+# built.  The harness takes exfatfs.static from it.
+EXFATFS_DIR ?= $(HOME)/src/exfatfs
+
+exfatfs: hurd mig libdiskfs
+	$(MAKE) -C $(EXFATFS_DIR) clean
+	$(MAKE) -C $(EXFATFS_DIR) HURD_PREFIX=$(PREFIX)
+	@echo "=== gate: exfatfs ==="
+	$(call hurd-elf-gate,$(EXFATFS_DIR)/exfatfs.static)
 
 # 9pfs calls two RPC stubs directly: exec_exec_paths (file-exec-paths.c,
 # from libhurduser) and mach_port_move_member (io-reauthenticate.c, from

@@ -2,8 +2,8 @@
 
 ## Trigger
 
-Use this skill when you change a disk filesystem translator in a Hurd tree
-(`exfatfs`, `fatfs`) and need to prove that it reads and writes images the
+Use this skill when you change a disk filesystem translator (`fatfs` in a
+Hurd tree, or `exfatfs` in its own repo) and need to prove that it reads and writes images the
 way Linux does. Also use it when you add a filesystem to the test.
 
 ## Run the test
@@ -12,26 +12,17 @@ way Linux does. Also use it when you add a filesystem to the test.
 the packages image, and runs `scripts/exfatfs_test.sh`:
 
 ```sh
-make exfatfs-test HURD_TREE=~/src/hurd-exfatfs     # fatfs and exfatfs
-make exfatfs-test FS=fat                           # the fatfs control only, from 3p/hurd
-make exfatfs-test HURD_TREE=... EXFAT_WRITE=0      # exFAT read checks only
-make exfatfs-test HURD_TREE=... REUSE=1            # rerun against a failed run's guest
+make exfatfs-test EXFATFS_DIR=~/src/exfatfs        # fatfs and exfatfs
+make exfatfs-test FS=fat                           # the fatfs control only
+make exfatfs-test FS=exfat                         # exfatfs only
+make exfatfs-test EXFAT_WRITE=0                    # exFAT read checks only
+make exfatfs-test REUSE=1                          # rerun against a failed run's guest
 ```
 
-The pinned `3p/hurd` has fatfs but not exfatfs. exfatfs comes with
-hurdkit/hurd's exfatfs change, which is not in the pinned `hurdkit` branch
-yet. Until it is, set `HURD_TREE` to a Hurd checkout that has the
-`exfatfs/` directory, for example a clone of the branch of that change.
-Without one, the build stops before it starts:
-
-```text
-HURD_TREE=.../3p/hurd has no exfatfs translator. exfatfs needs a Hurd tree
-with the exfatfs translator (hurdkit/hurd's exfatfs change, not yet in the
-pinned 3p/hurd): pass HURD_TREE=<that tree>, or FS=fat to test the fatfs
-control alone
-```
-
-`FS=fat` builds and tests fatfs alone, so it works with the pinned tree.
+fatfs is built from `HURD_TREE`, by default the pinned `3p/hurd`.
+exfatfs is built from its own repo,
+[exfatfs](https://github.com/davidbluntsrapper/exfatfs), checked out at
+`EXFATFS_DIR`.
 
 The run ends with `exfatfs-test: N passed, M failed` and exits non-zero on
 any failure. Each `PASS` and `FAIL` line names one check. The work files
@@ -42,11 +33,12 @@ The target takes these variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `HURD_TREE` | `3p/hurd` | Hurd source tree the translators are built from |
+| `HURD_TREE` | `3p/hurd` | Hurd source tree fatfs is built from |
+| `EXFATFS_DIR` | `~/src/exfatfs` | Checkout of the exfatfs repo |
 | `TEST_IMG` | `img/hurd.packages.qcow2` | Image the guest overlay is based on |
 | `SSH_KEY_DIR` | `img/keys` | Directory that holds `root_ed25519` |
 | `SSH_PORT` | `2222` | Host port forwarded to the guest's sshd |
-| `BUILD` | `~/work/x86_64-gnu-build` | Cross build root; the translators go to `$(BUILD)/hurd-translators` |
+| `BUILD` | `~/work/x86_64-gnu-build` | Cross build root; fatfs goes to `$(BUILD)/hurd-translators` |
 | `FS` | `fat exfat` | Filesystems to build and test |
 | `EXFAT_WRITE` | `1` | `0` skips the exFAT write checks |
 | `REUSE` | `0` | `1` runs the checks against the guest a failed run left running |
@@ -55,7 +47,8 @@ The target takes these variables:
 If another guest already uses port 2222, pass a free `SSH_PORT`. Two runs
 from the same checkout share `img/tmp/exfatfs-test-qemu.pid` and cannot
 run at the same time. Give each concurrent run its own checkout and its
-own `BUILD`.
+own `BUILD`. `make exfatfs` builds in `EXFATFS_DIR` itself, so
+concurrent runs also need their own exfatfs checkout.
 
 ### After a failed run
 
@@ -84,13 +77,22 @@ aborted run does not leave a loop mount behind.
 `make -C toolchain fs-translators` copies `HURD_TREE` to
 `$(BUILD)/hurd-translators-src`, configures the copy out of tree for
 `x86_64-gnu`, builds the libraries a libdiskfs translator links, and
-builds `fatfs/fatfs.static` and `exfatfs/exfatfs.static`. The binaries are
-static, so they run in the guest whatever Hurd libraries the Debian image
-ships. The `storeio` target uses the same `hurd-configure` recipe.
+builds `fatfs/fatfs.static`. The binaries are static, so they run in the
+guest whatever Hurd libraries the Debian image ships. The `storeio` target
+uses the same `hurd-configure` recipe.
+
+`make -C toolchain exfatfs` runs `make` in `EXFATFS_DIR` with
+`HURD_PREFIX` set to the cross prefix, the way the `9pfs` target builds
+`3p/9pfs`. The exfatfs repo links libdiskfs, libstore, and libhurdbugaddr
+from the prefix. The `hurd` stage does not install them, so the
+`libdiskfs` target installs them from `3p/hurd` the first time. The
+static binary links the store types that the prefix's libstore has:
+`device` and `remap`, plus `gunzip` if zlib was in the prefix when
+libstore was built.
 
 The top-level target builds only the translators that `FS` names
 (`<fs>fs` for each `<fs>`). Before any build step it checks that
-`HURD_TREE` has each one, and stops with the message above if not.
+`HURD_TREE` has each in-tree one, and stops if not.
 
 The copy and the build directory are recreated on every run, so a run
 never depends on an earlier build. A full build takes about 15 seconds of
@@ -173,7 +175,9 @@ applied by Python to a plain host copy of the image's contents.
 
 1. Make sure the translator is the directory `<fs>fs` in the Hurd tree
    and that the directory builds `<fs>fs.static`. The build and the test
-   both derive the name from the entry `<fs>` in `FS`.
+   both derive the name from the entry `<fs>` in `FS`. A translator in
+   its own repo, like exfatfs, needs its own toolchain target and its own
+   branch in the `bins` loop of the script instead.
 2. Add a `case` branch to the image loop in `scripts/exfatfs_test.sh`. It
    must leave `$WORK/<fs>.img` and the host's manifest in
    `$WORK/host-<fs>.txt`. Build the image with a tool that does not share
