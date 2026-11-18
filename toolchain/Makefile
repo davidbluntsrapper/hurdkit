@@ -25,7 +25,7 @@ SSH_PORT ?= 2222
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch compress-libs zlib xz zstd lz4 lzo binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp libdiskfs storeio fs-translators exfatfs virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch compress-libs zlib xz zstd lz4 lzo binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp libdiskfs storeio fs-translators exfatfs squashfs virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -430,8 +430,8 @@ libirqhelp: hurd mig
 	ls $(PREFIX)/lib/libirqhelp.so $(PREFIX)/include/hurd/irqhelp.h >/dev/null
 
 # libdiskfs and libstore are not installed by the `hurd` stage either.  The
-# standalone exfatfs translator links them from the prefix, with
-# libhurdbugaddr for its --help bug address.  libstore's install includes
+# standalone exfatfs and squashfs translators link them from the prefix,
+# with libhurdbugaddr for their --help bug address.  libstore's install includes
 # the libstore_<type>.a archives that select the store types a static
 # filesystem links.  libstore has gunzip and bunzip2 only if zlib and
 # libbz2 are in the prefix when it is configured.
@@ -663,6 +663,21 @@ lzo: gcc2
 	    rm -rf $(BUILD)/lzo; \
 	fi
 	$(call compress-gate,lzo,lzo/lzo1x.h,lzo2,if (lzo_init() != LZO_E_OK) return 1)
+
+# The squashfs translator lives in its own repo too, built like exfatfs.
+# SQUASHFS_DIR selects which checkout is built, and the harness takes
+# squashfs.static from it.  The WITH_* settings make a missing
+# compression library fail the build instead of leaving its compressor
+# out.  compress-libs comes before libdiskfs so that a first libdiskfs
+# build finds zlib and gives libstore the gunzip store type.
+SQUASHFS_DIR ?= $(HOME)/src/squashfs
+
+squashfs: hurd mig compress-libs libdiskfs
+	$(MAKE) -C $(SQUASHFS_DIR) clean
+	$(MAKE) -C $(SQUASHFS_DIR) HURD_PREFIX=$(PREFIX) \
+	    WITH_GZIP=yes WITH_XZ=yes WITH_ZSTD=yes WITH_LZ4=yes WITH_LZO=yes
+	@echo "=== gate: squashfs ==="
+	$(call hurd-elf-gate,$(SQUASHFS_DIR)/squashfs.static)
 
 # 9pfs calls two RPC stubs directly: exec_exec_paths (file-exec-paths.c,
 # from libhurduser) and mach_port_move_member (io-reauthenticate.c, from

@@ -3,8 +3,11 @@
 ## Trigger
 
 Use this skill when you change a disk filesystem translator (`fatfs` in a
-Hurd tree, or `exfatfs` in its own repo) and need to prove that it reads and writes images the
-way Linux does. Also use it when you add a filesystem to the test.
+Hurd tree, or `exfatfs` or `squashfs` in its own repo) and need to prove
+that it reads and writes images the way Linux does. Also use it when you
+add a filesystem to the test. `make exfatfs-test` covers fatfs and exfatfs.
+`make squashfs-test` covers squashfs and is described in
+[The squashfs test](#the-squashfs-test).
 
 ## Run the test
 
@@ -23,6 +26,9 @@ fatfs is built from `HURD_TREE`, by default the pinned `3p/hurd`.
 exfatfs is built from its own repo,
 [exfatfs](https://github.com/hurdkit/exfatfs), checked out at
 `EXFATFS_DIR`.
+
+`FS=fat` builds and tests fatfs alone. With the pinned tree it builds,
+but `fat: mount` fails until the fatfs fix lands (see Gotchas).
 
 The run ends with `exfatfs-test: N passed, M failed` and exits non-zero on
 any failure. Each `PASS` and `FAIL` line names one check. The work files
@@ -89,6 +95,13 @@ from the prefix. The `hurd` stage does not install them, so the
 static binary links the store types that the prefix's libstore has:
 `device` and `remap`, plus `gunzip` if zlib was in the prefix when
 libstore was built.
+
+`make -C toolchain squashfs` builds `SQUASHFS_DIR` the same way. It runs
+`compress-libs` first (see
+[How the compression libraries are built](#how-the-compression-libraries-are-built)),
+so a first `libdiskfs` build finds zlib and libstore gets `gunzip`. It
+asks the squashfs repo for all five compressors, so a missing library
+fails the build instead of leaving its compressor out.
 
 The top-level target builds only the translators that `FS` names
 (`<fs>fs` for each `<fs>`). Before any build step it checks that
@@ -176,7 +189,7 @@ applied by Python to a plain host copy of the image's contents.
 1. Make sure the translator is the directory `<fs>fs` in the Hurd tree
    and that the directory builds `<fs>fs.static`. The build and the test
    both derive the name from the entry `<fs>` in `FS`. A translator in
-   its own repo, like exfatfs, needs its own toolchain target and its own
+   its own repo, like exfatfs or squashfs, needs its own toolchain target and its own
    branch in the `bins` loop of the script instead.
 2. Add a `case` branch to the image loop in `scripts/exfatfs_test.sh`. It
    must leave `$WORK/<fs>.img` and the host's manifest in
@@ -191,6 +204,179 @@ The mount and manifest checks then run for the new filesystem. Add checks
 for its own behavior after the exFAT blocks, with a `pass` or `fail`
 line per check.
 
+## The squashfs test
+
+`make squashfs-test` checks the read-only `squashfs` translator against
+the Linux kernel squashfs driver. The goal is parity with Linux: the
+guest's view of every image must equal the Linux view, field by field.
+
+### Run it
+
+```sh
+make squashfs-test SQUASHFS_DIR=~/src/squashfs    # build, boot, run every check
+make squashfs-test REUSE=1                         # rerun against a failed run's guest
+make squashfs-test FUZZ_SEED=7 FUZZ_COUNT=500
+```
+
+The translator comes from its own repo,
+[squashfs](https://github.com/hurdkit/squashfs), checked out at
+`SQUASHFS_DIR`. The target builds it with `make squashfs` (see
+[How the translators are built](#how-the-translators-are-built)) and
+takes `squashfs.static` from that checkout. `make squashfs` builds in
+`SQUASHFS_DIR` itself, so concurrent runs need their own squashfs
+checkout. The other variables are the ones in the table above
+(`TEST_IMG`, `SSH_KEY_DIR`, `SSH_PORT`, `REUSE`, `GUEST_TIMEOUT`), plus:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SQUASHFS_DIR` | `~/src/squashfs` | Checkout of the squashfs repo |
+| `FUZZ_SEED` | `1` | Seed of the fuzz images; copy k of seed s is the same on every run |
+| `FUZZ_COUNT` | `200` | Number of fuzz images |
+| `SQUASHFS_BIN` | `~/src/squashfs/squashfs.static` | Script only: the binary used as the translator; the target sets it to `SQUASHFS_DIR/squashfs.static` |
+| `CROSS_CC` | `~/opt/x86_64-gnu/bin/x86_64-gnu-gcc` | Script only: compiler for `scripts/fs_probe.c` |
+
+To check the harness itself, or to run it without a build, call the
+script with any binary as the translator:
+
+```sh
+SQUASHFS_BIN=/path/to/stub SSH_PORT=2241 SSH_KEY_DIR=... BASE_IMG=... \
+    bash scripts/squashfs_test.sh
+```
+
+The work files stay in `img/tmp/squashfs-test/`: the source trees
+(`src-*`), the images (`img/`, `corrupt/`, `fuzz/`), the expected,
+Linux and guest manifests (`expect-*.txt`, `linux-*.txt`,
+`guest-*.txt`), each comparison's diff (`compare-*.txt`) and the fuzz
+results (`fuzz-results.txt`). The QEMU log is
+`img/tmp/squashfs-test-qemu.log` and the pidfile
+`img/tmp/squashfs-test-qemu.pid`.
+
+### The images
+
+`scripts/squashfs_images.py` writes four source trees and the pseudo
+definitions for each. mksquashfs builds the images without root: owners,
+device nodes, modes that the user cannot read and xattrs come from
+pseudo definitions (`-pf`). One list in the script (`pseudo_defs`)
+produces both the definitions and the changes to the expected manifest,
+so the two cannot disagree.
+
+| Tree | What it holds | Images |
+|---|---|---|
+| `main` | Empty and 1-byte files; files one byte under, at and over 4 KiB, 128 KiB and 1 MiB; a 5 MiB random file; an 8 MiB compressible file; two identical files; sparse files with holes inside and at the end; 3500 entries in one directory; 40 nested directories; an empty directory; 255-byte ASCII and UTF-8 names; other UTF-8 names; short, 1500-byte, dangling and directory symlinks; three hard links to one file; a fifo; a socket; char and block devices, some with large major and minor numbers; 300 files with distinct uids and gids; setuid, setgid and sticky bits, mode 0000; mtimes 0, 4000000000 and 4294967295; a static Hurd binary and a shell script | One per entry of `VARIANTS`: gzip, lzo, xz, lz4 and zstd, each with default and non-default options (`-Xcompression-level`, `-Xwindow-size`, `-Xstrategy`, `-Xalgorithm`, `-Xbcj x86,arm`, `-Xdict-size`, `-Xhc`); uncompressed (`-noI -noD -noF -noX`); `-b 4K`; `-b 1M`; `-no-fragments`; `-always-use-fragments -tailends`; `-no-duplicates`; `-no-exports -no-sparse` |
+| `wide` | 72173 inodes in 71 directories, 4201 distinct ids (the id table spans three metadata blocks), and a 5 GiB sparse file with data across the 4 GiB boundary | `wide.img` (gzip) |
+| `xattr` | `user.*`, `trusted.*` and `security.*` xattrs on files and a directory, a 6148-byte value, 120 xattrs on one file, two files with the same set, an empty value | `xattr.img` (xz) |
+| `small` | A few files, a compressible multi-block file, one fragment, three ids | `small.img` (gzip), the source of the corrupt and fuzz images; `lzma.img` (compressor id 2, which Linux does not support); `compressor-99.img` |
+
+### What the squashfs test checks
+
+Every check name starts with `squash:`.
+
+| Check | What must hold |
+|---|---|
+| `oracle: Linux reads NAME.img as the source tree` | Host only. The Linux manifest equals the source tree's with the pseudo definitions applied (inode numbers, st_blocks, and directory sizes and link counts left out, because the source tree cannot know them) |
+| `oracle: Linux reads the xattrs of the pseudo definitions` | Host only. Every xattr, read as root, has the defined length and sha256 |
+| `oracle: unsquashfs extracts gzip.img as the source tree` | Host only. `sudo unsquashfs` gives the same manifest |
+| `oracle: Linux refuses lzma.img`, `... compressor-99.img` | Host only. Linux does not mount them |
+| `NAME: mount` | The translator mounts the image read-only on a file store |
+| `Hurd interface: every device number fits the Hurd's dev_t` | Host only. glibc on the Hurd keeps an 8-bit major number and a minor number without its bits 8 to 15 (`mmmmMMmm`), so a device number outside that cannot reach any Hurd program. This check lists the image's numbers that do not fit; it fails while the test tree has some (`dev/big-numbers`, `dev/disk-high`), as a gap of the interface rather than of the translator |
+| `NAME: manifest matches Linux` | The guest's full manifest equals the Linux one in every field: type, size, mtime, sha256, mode with setuid, setgid and sticky bits, uid, gid, nlink (directories too), device numbers as the Hurd's `dev_t` holds Linux's (`fs_image_test.py hurd-dev`), symlink target, inode number and st_blocks |
+| `lookups: a missing name gives ENOENT, .. at the root leaves the mount` | `lstat` of missing names gives ENOENT; `ROOT/..` is the mount point's parent; `DIR/..` is the root |
+| `readdir (readdir1) of X lists each entry once` | `fs_probe readdir1` lists the root and the 3500-entry directory with one `dir_readdir` RPC per entry; the names equal Linux's, `.` and `..` included, each once |
+| `readdir (seekdir 7) of X lists each entry once` | Same, reading 7 entries, then `telldir`, `closedir`, `opendir` and `seekdir` back |
+| `exec a static binary from the image`, `exec a script from the image` | Both run from the mount and print their marker |
+| `mmap reads the same bytes as Linux` | The sha256 of five files read through `mmap` equals Linux's |
+| `writes refused with EROFS` | Create, open for write, truncate, unlink, chmod, chown, utime, rename, link, symlink, mkdir, rmdir and mkfifo all fail with EROFS |
+| `8 parallel readers get the single reader's manifest` | Eight full manifests taken at once all equal the one taken alone, so a concurrency bug shows apart from a reader bug |
+| `xattr: user, trusted and security xattrs match Linux` | `fs_probe xattrs` (glibc `llistxattr` and `lgetxattr`, as any Hurd program sees them) lists the same names, lengths and sha256 of values as Linux, for every entry of the image |
+| `refuses lzma.img, naming the compressor`, `refuses compressor-99.img, ...` | The mount fails with the translator's own message, which names `lzma` or `99` |
+| `corrupt NAME.img: at least as strict as Linux` | See below |
+| `the gzip mount still serves after the corrupt images` | The first mount still answers |
+| `fuzz: N corrupted images, no crash or hang` | See below |
+| `clean unmount (settrans -gR) of every mounted image` | Every `settrans -gR` succeeds. `-R` because a lookup of a fifo starts `/hurd/fifo` on it below the mount, and plain `-g` then fails with EBUSY; tmpfs does the same |
+
+The corrupt images are copies of `small.img`: truncated at half of
+`bytes_used`, a bad magic, version 3.1, an id table offset past the end,
+and one bit flipped in the middle of the first metadata block of the
+inode, directory, fragment and id tables and in the first data block.
+Before the guest boots, the run records what Linux does with each:
+`refused` (no mount), `errors` (mounts, some access fails) or `served`
+(every access succeeds). Where Linux refuses or errors, the translator
+must refuse the mount with its own message or fail an access. Where
+Linux serves, the translator may serve. It must never crash or hang:
+after a walk the translator must still answer `fsysopts`. Linux serves
+some of these images (it lists an empty root for the directory-table
+flip, and the id table of `small.img` is stored uncompressed, so a flip
+changes a uid). The recorded levels are printed as `Linux on corrupt
+NAME.img: LEVEL`.
+
+The fuzz images are `FUZZ_COUNT` copies of `small.img` with 1 to 4
+random bytes replaced. `fs_image_test.py mount-walk` runs in the guest,
+mounts each on its own mount point (so a hung translator does not block
+the next), walks it, and checks that the translator is still alive. Each
+image ends `refused`, `served`, `crash` or `hang`. Any `crash` or `hang`
+fails the check, and the message names the seed. The results are in
+`fuzz-results.txt`, one line per image.
+
+### Proving the harness
+
+Every guest check must fail, not error out, when the translator is
+missing or wrong. To see the red run, use a stub as `SQUASHFS_BIN`, for
+example a script that serves an empty directory:
+
+```sh
+printf '#!/bin/sh\nexec /hurd/tmpfs 64M\n' > /tmp/stub && chmod 755 /tmp/stub
+SQUASHFS_BIN=/tmp/stub ... bash scripts/squashfs_test.sh
+```
+
+The `oracle:` checks still pass with a stub. They prove the oracles, not
+the translator.
+
+### How the compression libraries are built
+
+The translator links zlib, liblzma, liblzo2, liblz4 and libzstd
+statically. `make compress-libs` (`make -C toolchain compress-libs`, stages
+`zlib`, `xz`, `zstd`, `lz4`, `lzo`) downloads each pinned release tarball
+into `~/work/x86_64-gnu-src`, checks its sha256 against the value in
+`toolchain/Makefile`, builds it in a fresh `$(BUILD)/<lib>` with the cross
+compiler and installs the headers, the `.a` and the `.pc` file into
+`~/opt/x86_64-gnu`. No shared objects are installed. liblzma is built
+without the xz tools, and libzstd without threads. A stage skips when its
+`.a` is installed, and its gate links a static GNU/Hurd program that
+calls the library. To move to a new release, change the `*_VER` and
+`*_SHA256` lines together.
+
+### squashfs host prerequisites
+
+- squashfs-tools 4.6 or later (`mksquashfs`, `unsquashfs`).
+- A Linux kernel with squashfs and all five decompressors
+  (`CONFIG_SQUASHFS_{ZLIB,LZO,XZ,LZ4,ZSTD}`) and `CONFIG_SQUASHFS_XATTR`.
+- Passwordless sudo for `mount`, `umount`, `unsquashfs`, `rm` (of the
+  extraction) and `python3` (to read files the user cannot read, and
+  `trusted.*` xattrs).
+- About 1 GB free under `img/tmp`, and a host filesystem with sparse
+  files and `user.*` xattrs for the source trees.
+- The cross compiler, for `scripts/fs_probe.c`.
+
+### squashfs gotchas
+
+- mksquashfs 4.6.1 corrupts its heap when it decodes a long hex (`0x`)
+  xattr value in a pseudo definition, and it rejects an empty value. The
+  builder encodes values in base64 (`0s`), and the empty value comes from
+  a `user.*` xattr on the source file.
+- A pseudo modify (`M`) of a directory conflicts with pseudo definitions
+  of entries inside it, and mksquashfs then ignores it.
+- mksquashfs cannot read a file the user cannot read. Give the source
+  file a readable mode and set the real mode with a pseudo `M`.
+- mksquashfs pads the image to 4 KiB, so a truncation must cut
+  `bytes_used`, not the file length, or it removes only padding.
+- The guest's Python (3.14) reads at most 1024 bytes in `os.readlink`
+  (its `MAXPATHLEN`), so the 1539-byte symlink came back truncated.
+  `fs_image_test.py` falls back to `readlink(1)` when the target is
+  shorter than `st_size`.
+- The guest's Python has no `os.listxattr`, so the guest side of the
+  xattr check uses `fs_probe xattrs` (glibc's `llistxattr` and
+  `lgetxattr`).
+
 ## Gotchas
 
 - `ssh guest "settrans -a ..."` never returns when the mount succeeds. The
@@ -201,11 +387,13 @@ line per check.
 - Do not `pkill -f` a script name from an agent's shell. The shell has
   the same string on its command line and kills itself. Stop QEMU with the
   pid in `img/tmp/exfatfs-test-qemu.pid`.
-- Upstream fatfs reads the 32-bit FAT32 fields `total_sectors_32` and
+- Upstream fatfs reads the 32-bit fields `total_sectors_32` and
   `sectors_per_fat_32` with `read_word`, which reads 16 bits, so a FAT32
   volume fails or gets a truncated size. hurdkit/hurd's exfatfs change
-  fixes this too. The control image is FAT16, so the control passes on a
-  tree with or without the fix.
+  fixes this too. `total_sectors_32` is also used by FAT16 volumes of more
+  than 65535 sectors, and the 64 MiB control image is one, so with the
+  pinned `3p/hurd` (no fix) `fat: mount` fails with `Number of total
+  sectors is zero`. Run the control with a `HURD_TREE` that has the fix.
 - exfat-fuse always asks for `allow_other`, so it cannot mount without
   root unless `user_allow_other` is set. The test uses the kernel driver.
 - The kernel exfat driver does not fill freed gaps first. To get a

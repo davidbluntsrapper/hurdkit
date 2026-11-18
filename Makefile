@@ -75,6 +75,8 @@ VNET_IMG       ?= $(IMG_DIR)/hurd.vnet.qcow2
 VIRTIO_9P_BIN := $(VIRTIO_DIR)/virtio-9p
 # The standalone repo of the exFAT translator, overridable like VIRTIO_DIR.
 EXFATFS_DIR   ?= $(HOME)/src/exfatfs
+# The standalone repo of the squashfs translator.
+SQUASHFS_DIR  ?= $(HOME)/src/squashfs
 # The gnumach source checkout used for the kernel build. Override this to
 # build a worktree instead of the pinned 3p checkout.
 GNUMACH_DIR   ?= 3p/gnumach
@@ -110,7 +112,7 @@ LOCK_FILE     := $(IMG_DIR)/.build.lock
 	virtio-net-image virtio-net-connectivity-test \
 	virtio-bench-image virtio-bench-vnet-image \
 	run-smp-tests run-up-tests virtio-bench virtio-bench-image storeio \
-	fs-translators exfatfs exfatfs-test compress-libs
+	fs-translators exfatfs exfatfs-test squashfs squashfs-test compress-libs
 
 # The default builds the whole image pipeline, with every intermediate
 # exposed as its own qcow2 (see the stage rules below).
@@ -346,6 +348,7 @@ FS_IN_TREE    := $(filter-out exfat,$(FS))
 fs-translators: fetch-3p ; $(MAKE) -C toolchain fs-translators \
 	HURD_TREE=$(abspath $(HURD_TREE)) FS_TRANSLATORS="$(addsuffix fs,$(FS_IN_TREE))"
 exfatfs: fetch-3p ; $(MAKE) -C toolchain exfatfs EXFATFS_DIR=$(abspath $(EXFATFS_DIR))
+squashfs: fetch-3p ; $(MAKE) -C toolchain squashfs SQUASHFS_DIR=$(abspath $(SQUASHFS_DIR))
 
 # Boot the guest with a host directory shared through QEMU's virtio-9p
 # device and run the translator test matrix: the device selftest, the
@@ -415,6 +418,24 @@ exfatfs-test: $(if $(FS_IN_TREE),fs-translators) $(if $(filter exfat,$(FS)),exfa
 		EXFATFS_STATIC="$(abspath $(EXFATFS_DIR))/exfatfs.static" \
 		FS="$(FS)" EXFAT_WRITE="$(EXFAT_WRITE)" \
 		bash scripts/exfatfs_test.sh
+
+# Build the squashfs translator from SQUASHFS_DIR, with the static
+# compression libraries it links, boot the guest and run the squashfs
+# matrix: images made by mksquashfs for every compressor and layout
+# option, mounted in the guest and compared field by field with the
+# Linux kernel driver's view, plus lookups, readdir, exec, mmap, EROFS,
+# xattrs, corrupt images, a seeded fuzz run and parallel readers (see
+# scripts/squashfs_test.sh and skills/FILESYSTEM_TESTING.md).  Needs sudo
+# for loop mounts.  FUZZ_SEED and FUZZ_COUNT set the fuzz run.  A failed
+# run leaves its guest running; REUSE=1 reruns the checks against it.
+squashfs-test: squashfs $(TEST_IMG)
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		SSH_KEY_DIR="$(abspath $(SSH_KEY_DIR))" \
+		BASE_IMG="$(abspath $(TEST_IMG))" \
+		SQUASHFS_BIN="$(abspath $(SQUASHFS_DIR))/squashfs.static" \
+		FUZZ_SEED="$(FUZZ_SEED)" FUZZ_COUNT="$(FUZZ_COUNT)" \
+		bash scripts/squashfs_test.sh
 
 # Build a guest image whose primary network interface is virtio-net (replacing
 # e1000): stages the virtio-net binary and a matching /etc/network/interfaces
