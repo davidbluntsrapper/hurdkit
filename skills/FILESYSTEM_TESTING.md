@@ -31,9 +31,23 @@ exfatfs is built from its own repo,
 but `fat: mount` fails until the fatfs fix lands (see Gotchas).
 
 The run ends with `exfatfs-test: N passed, M failed` and exits non-zero on
-any failure. Each `PASS` and `FAIL` line names one check. The work files
-(images, manifests, the written image) stay in `img/tmp/exfatfs-test/`
-for inspection, and the QEMU log is `img/tmp/exfatfs-test-qemu.log`.
+any failure. Each `PASS` and `FAIL` line names one check.
+
+A check can also end `KNOWN`: it fails because of a gap in an interface
+outside the translator, such as glibc's, which the translator cannot
+close. `known NAME REASON STATUS` in `scripts/fs_test_lib.sh` records it.
+A known check still runs its comparison, and STATUS is the comparison's
+exit status. While the comparison fails, the check prints `KNOWN` with
+the reason, the summary counts it apart (`N passed, 0 failed, 2 known
+gaps`), and the run does not fail. When the comparison passes, the gap
+has closed, and the check fails with `known gap closed; promote this
+check` until it is made an ordinary `pass`/`fail` check. Use `known` only
+for a gap the translator cannot fix, and give the reason with the file
+or interface that causes it.
+
+The work files (images, manifests, the written image) stay in
+`img/tmp/exfatfs-test/` for inspection, and the QEMU log is
+`img/tmp/exfatfs-test-qemu.log`.
 
 The target takes these variables:
 
@@ -278,7 +292,7 @@ Every check name starts with `squash:`.
 | `oracle: unsquashfs extracts gzip.img as the source tree` | Host only. `sudo unsquashfs` gives the same manifest |
 | `oracle: Linux refuses lzma.img`, `... compressor-99.img` | Host only. Linux does not mount them |
 | `NAME: mount` | The translator mounts the image read-only on a file store |
-| `Hurd interface: every device number fits the Hurd's dev_t` | Host only. glibc on the Hurd keeps an 8-bit major number and a minor number without its bits 8 to 15 (`mmmmMMmm`), so a device number outside that cannot reach any Hurd program. This check lists the image's numbers that do not fit; it fails while the test tree has some (`dev/big-numbers`, `dev/disk-high`), as a gap of the interface rather than of the translator |
+| `Hurd interface: every device number fits the Hurd's dev_t` | Host only, and `KNOWN` while it fails. glibc on the Hurd keeps an 8-bit major number and a minor number without its bits 8 to 15 (`mmmmMMmm`), so a device number outside that cannot reach any Hurd program. This check lists the image's numbers that do not fit, which the test tree has (`dev/big-numbers`, `dev/disk-high`) |
 | `NAME: manifest matches Linux` | The guest's full manifest equals the Linux one in every field: type, size, mtime, sha256, mode with setuid, setgid and sticky bits, uid, gid, nlink (directories too), device numbers as the Hurd's `dev_t` holds Linux's (`fs_image_test.py hurd-dev`), symlink target, inode number and st_blocks |
 | `lookups: a missing name gives ENOENT, .. at the root leaves the mount` | `lstat` of missing names gives ENOENT; `ROOT/..` is the mount point's parent; `DIR/..` is the root |
 | `readdir (readdir1) of X lists each entry once` | `fs_probe readdir1` lists the root and the 3500-entry directory with one `dir_readdir` RPC per entry; the names equal Linux's, `.` and `..` included, each once |
@@ -287,7 +301,7 @@ Every check name starts with `squash:`.
 | `mmap reads the same bytes as Linux` | The sha256 of five files read through `mmap` equals Linux's |
 | `writes refused with EROFS` | Create, open for write, truncate, unlink, chmod, chown, utime, rename, link, symlink, mkdir, rmdir and mkfifo all fail with EROFS |
 | `8 parallel readers get the single reader's manifest` | Eight full manifests taken at once all equal the one taken alone, so a concurrency bug shows apart from a reader bug |
-| `xattr: user, trusted and security xattrs match Linux` | `fs_probe xattrs` (glibc `llistxattr` and `lgetxattr`, as any Hurd program sees them) lists the same names, lengths and sha256 of values as Linux, for every entry of the image |
+| `xattr: user, trusted and security xattrs match Linux` | `KNOWN` while it fails: glibc's `hurd/xattr.c` passes only `gnu.*` names. `fs_probe xattrs` (glibc `llistxattr` and `lgetxattr`, as any Hurd program sees them) must list the same names, lengths and sha256 of values as Linux, for every entry of the image |
 | `refuses lzma.img, naming the compressor`, `refuses compressor-99.img, ...` | The mount fails with the translator's own message, which names `lzma` or `99` |
 | `corrupt NAME.img: at least as strict as Linux` | See below |
 | `the gzip mount still serves after the corrupt images` | The first mount still answers |

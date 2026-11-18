@@ -1,6 +1,6 @@
 #!/bin/bash
 # Shared plumbing for the filesystem translator tests (exfatfs_test.sh,
-# squashfs_test.sh): PASS/FAIL bookkeeping, the host work directory and its
+# squashfs_test.sh): PASS/FAIL/KNOWN bookkeeping, the host work directory and its
 # loop mount, booting or reusing the guest, and bounded guest commands.
 #
 # The caller sets these, then sources this file:
@@ -21,14 +21,28 @@ done
 FAILED=0
 PASSES=()
 FAILS=()
+KNOWNS=()
 GUEST_UP=0
 
 pass() { PASSES+=("$1"); echo "$FT_NAME: PASS $1"; }
 fail() { FAILS+=("$1"); FAILED=1; echo "$FT_NAME: FAIL $1"; }
+# known NAME REASON STATUS: check NAME fails because of REASON, a gap in an
+# interface outside the translator, and does not fail the run.  STATUS is
+# the exit status of the check's comparison, which still runs: 0 means the
+# gap has closed, and the check fails until it is made an ordinary one.
+known() {
+    if [[ "$3" == 0 ]]; then
+        fail "$1 (known gap closed; promote this check)"
+    else
+        KNOWNS+=("$1: $2")
+        echo "$FT_NAME: KNOWN $1 ($2)"
+    fi
+}
 finish() {
     echo
-    echo "$FT_NAME: ${#PASSES[@]} passed, ${#FAILS[@]} failed"
+    echo "$FT_NAME: ${#PASSES[@]} passed, ${#FAILS[@]} failed${KNOWNS[0]+, ${#KNOWNS[@]} known gaps}"
     for f in "${FAILS[@]}"; do echo "  FAIL $f"; done
+    for k in "${KNOWNS[@]}"; do echo "  KNOWN $k"; done
     if [[ "$REUSE" == 1 && "$FAILED" == 0 ]]; then
         echo "$FT_NAME: REUSE=1; guest left running"
     fi
