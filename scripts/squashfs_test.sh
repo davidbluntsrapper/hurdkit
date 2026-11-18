@@ -115,11 +115,9 @@ for name in "${VARIANTS[@]}" wide xattr small; do
     unheld+=$(python3 "$TOOL" hurd-dev "$WORK/linux-$name.txt" "$WORK/linux-$name.hurd-dev.txt")$'\n'
 done
 unheld=$(echo "$unheld" | grep . | sort -u | tr '\t\n' '  ' || true)
-if [[ -z "$unheld" ]]; then
-    pass "squash: Hurd interface: every device number fits the Hurd's dev_t"
-else
-    fail "squash: Hurd interface: every device number fits the Hurd's dev_t (path, Linux, Hurd: $unheld)"
-fi
+rc=0; [[ -z "$unheld" ]] || rc=1
+known "squash: Hurd interface: every device number fits the Hurd's dev_t" \
+    "glibc bits/sysmacros.h gives the Hurd's dev_t an 8-bit major; path, Linux, Hurd: $unheld" $rc
 if python3 "$TOOL" compare "$WORK/expect-xattrs.txt" "$WORK/linux-xattrs.txt"; then
     pass "squash: oracle: Linux reads the xattrs of the pseudo definitions"
 else
@@ -292,12 +290,10 @@ if mount_image xattr; then
     paths=$(cut -f13 "$WORK/linux-xattr.txt" | tr '\n' ' ')
     g "/tmp/fs_probe xattrs $(gmnt xattr) $paths" > "$WORK/guest-xattrs.raw" 2>&1 || true
     python3 "$TOOL" xattrs-from-probe "$WORK/guest-xattrs.raw" > "$WORK/guest-xattrs.txt" || true
-    if python3 "$TOOL" compare "$WORK/linux-xattrs.txt" "$WORK/guest-xattrs.txt" > "$WORK/compare-xattrs.txt"; then
-        pass "squash: xattr: user, trusted and security xattrs match Linux"
-    else
-        head -5 "$WORK/compare-xattrs.txt"
-        fail "squash: xattr: user, trusted and security xattrs match Linux"
-    fi
+    rc=0
+    python3 "$TOOL" compare "$WORK/linux-xattrs.txt" "$WORK/guest-xattrs.txt" > "$WORK/compare-xattrs.txt" || rc=$?
+    known "squash: xattr: user, trusted and security xattrs match Linux" \
+        "glibc hurd/xattr.c passes only gnu.* names" $rc
     unmount_image xattr
 else
     fail "squash: xattr: mount"
