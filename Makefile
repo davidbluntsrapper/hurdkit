@@ -110,7 +110,7 @@ LOCK_FILE     := $(IMG_DIR)/.build.lock
 	virtio-net-image virtio-net-connectivity-test \
 	virtio-bench-image virtio-bench-vnet-image \
 	run-smp-tests run-up-tests virtio-bench virtio-bench-image storeio \
-	fs-translators exfatfs exfatfs-test
+	fs-translators exfatfs exfatfs-test compress-libs
 
 # The default builds the whole image pipeline, with every intermediate
 # exposed as its own qcow2 (see the stage rules below).
@@ -335,6 +335,7 @@ virtio-balloon: fetch-3p    ; $(MAKE) -C toolchain virtio-balloon VIRTIO_DIR=$(V
 virtio-blk: fetch-3p    ; $(MAKE) -C toolchain virtio-blk VIRTIO_DIR=$(VIRTIO_DIR)
 virtio-net: fetch-3p    ; $(MAKE) -C toolchain virtio-net VIRTIO_DIR=$(VIRTIO_NET_DIR)
 storeio: fetch-3p       ; $(MAKE) -C toolchain storeio
+compress-libs: fetch-3p ; $(MAKE) -C toolchain compress-libs
 # HURD_TREE: the Hurd source tree the in-tree filesystem translators are
 # built from.  FS: the filesystems to build and test; each <fs> other than
 # exfat needs the translator <fs>fs in HURD_TREE.  exfatfs comes from its

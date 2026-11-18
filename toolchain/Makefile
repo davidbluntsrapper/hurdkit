@@ -25,7 +25,7 @@ SSH_PORT ?= 2222
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp libdiskfs storeio fs-translators exfatfs virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch compress-libs zlib xz zstd lz4 lzo binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp libdiskfs storeio fs-translators exfatfs virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -536,6 +536,134 @@ exfatfs: hurd mig libdiskfs
 	@echo "=== gate: exfatfs ==="
 	$(call hurd-elf-gate,$(EXFATFS_DIR)/exfatfs.static)
 
+# Static compression libraries for translators that decompress (squashfs
+# needs all five compressors the Linux driver supports).  Each stage
+# fetches a pinned release tarball into $(SRC), checks its sha256, builds
+# it in a fresh $(BUILD)/<lib> and installs headers, the .a and its .pc
+# file into $(PREFIX); no shared objects, so a translator linked against
+# them is self-contained.  The stage skips when its .a is installed.  Its
+# gate links a static GNU/Hurd program that calls the library.  Not in
+# the default `toolchain` chain: only translators that need them do.
+ZLIB_VER := 1.3.1
+XZ_VER   := 5.8.1
+ZSTD_VER := 1.5.7
+LZ4_VER  := 1.10.0
+LZO_VER  := 2.10
+
+# Per library: tarball name, download URL and sha256.
+zlib_TARBALL := zlib-$(ZLIB_VER).tar.gz
+zlib_URL     := https://github.com/madler/zlib/releases/download/v$(ZLIB_VER)/$(zlib_TARBALL)
+zlib_SHA256  := 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
+xz_TARBALL   := xz-$(XZ_VER).tar.xz
+xz_URL       := https://github.com/tukaani-project/xz/releases/download/v$(XZ_VER)/$(xz_TARBALL)
+xz_SHA256    := 0b54f79df85912504de0b14aec7971e3f964491af1812d83447005807513cd9e
+zstd_TARBALL := zstd-$(ZSTD_VER).tar.gz
+zstd_URL     := https://github.com/facebook/zstd/releases/download/v$(ZSTD_VER)/$(zstd_TARBALL)
+zstd_SHA256  := eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+lz4_TARBALL  := lz4-$(LZ4_VER).tar.gz
+lz4_URL      := https://github.com/lz4/lz4/releases/download/v$(LZ4_VER)/$(lz4_TARBALL)
+lz4_SHA256   := 537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
+lzo_TARBALL  := lzo-$(LZO_VER).tar.gz
+lzo_URL      := https://www.oberhumer.com/opensource/lzo/download/$(lzo_TARBALL)
+lzo_SHA256   := c0f892943208266f9b6543b3ae308fab6284c5c90e627931446fb49b4221a072
+
+CROSS_ENV := PATH=$(PREFIX)/bin:$$PATH CC=$(PREFIX)/bin/x86_64-gnu-gcc \
+	AR=$(PREFIX)/bin/x86_64-gnu-ar RANLIB=$(PREFIX)/bin/x86_64-gnu-ranlib
+
+# $(1): library name.  Download its tarball unless present, verify the
+# sha256 (a mismatch deletes the file and fails), then unpack a fresh
+# copy into $(BUILD)/$(1).  Ends inside the unpacked source directory.
+define compress-unpack
+mkdir -p $(SRC) && cd $(SRC) && \
+	{ test -f $($(1)_TARBALL) || { wget -q -O $($(1)_TARBALL).part $($(1)_URL) && \
+	    mv $($(1)_TARBALL).part $($(1)_TARBALL); }; } && \
+	{ echo "$($(1)_SHA256)  $($(1)_TARBALL)" | sha256sum -c --quiet || \
+	    { rm -f $(SRC)/$($(1)_TARBALL); exit 1; }; } && \
+	rm -rf $(BUILD)/$(1) && mkdir -p $(BUILD)/$(1) && \
+	tar -xf $(SRC)/$($(1)_TARBALL) -C $(BUILD)/$(1) --strip-components=1 && \
+	cd $(BUILD)/$(1)
+endef
+
+# $(1): library name, $(2): header, $(3): -l flag, $(4): C statement
+# calling the library.  Links a static GNU/Hurd test program.
+define compress-gate
+@echo "=== gate: $(1) ==="
+ls $(PREFIX)/include/$(2) $(PREFIX)/lib/lib$(3).a
+printf '#include <stdio.h>\n#include <$(2)>\nint main(void) { $(4); return 0; }\n' > $(BUILD)/$(1)-gate.c
+$(PREFIX)/bin/x86_64-gnu-gcc -static -o $(BUILD)/$(1)-gate $(BUILD)/$(1)-gate.c -l$(3)
+$(call hurd-elf-gate,$(BUILD)/$(1)-gate)
+rm -f $(BUILD)/$(1)-gate $(BUILD)/$(1)-gate.c
+endef
+
+compress-libs: zlib xz zstd lz4 lzo
+
+zlib: gcc2
+	@if [ -f $(PREFIX)/lib/libz.a ]; then \
+	    echo "(skipping: libz.a already installed)"; \
+	else \
+	    $(call compress-unpack,zlib) && \
+	    $(CROSS_ENV) CHOST=x86_64-gnu ./configure --static --prefix=$(PREFIX) && \
+	    $(CROSS_ENV) make -j$(NPROC) libz.a && \
+	    $(CROSS_ENV) make install && \
+	    rm -rf $(BUILD)/zlib; \
+	fi
+	$(call compress-gate,zlib,zlib.h,z,puts(zlibVersion()))
+
+# Only liblzma: the xz command-line tools are not wanted in the prefix.
+xz: gcc2
+	@if [ -f $(PREFIX)/lib/liblzma.a ]; then \
+	    echo "(skipping: liblzma.a already installed)"; \
+	else \
+	    $(call compress-unpack,xz) && \
+	    $(CROSS_ENV) ./configure --host=x86_64-gnu --build=x86_64-pc-linux-gnu \
+	        --prefix=$(PREFIX) --disable-shared --enable-static \
+	        --disable-xz --disable-xzdec --disable-lzmadec --disable-lzmainfo \
+	        --disable-lzma-links --disable-scripts --disable-doc --disable-nls && \
+	    $(CROSS_ENV) make -j$(NPROC) -C src/liblzma && \
+	    $(CROSS_ENV) make -C src/liblzma install && \
+	    rm -rf $(BUILD)/xz; \
+	fi
+	$(call compress-gate,xz,lzma.h,lzma,puts(lzma_version_string()))
+
+# Single-threaded: translators drive their own threads, and the
+# multithreaded build adds a pthread dependency to every user.
+zstd: gcc2
+	@if [ -f $(PREFIX)/lib/libzstd.a ]; then \
+	    echo "(skipping: libzstd.a already installed)"; \
+	else \
+	    $(call compress-unpack,zstd) && \
+	    $(CROSS_ENV) make -j$(NPROC) -C lib libzstd.a-nomt && \
+	    $(CROSS_ENV) make -C lib install-static install-includes install-pc \
+	        PREFIX=$(PREFIX) && \
+	    rm -rf $(BUILD)/zstd; \
+	fi
+	$(call compress-gate,zstd,zstd.h,zstd,puts(ZSTD_versionString()))
+
+lz4: gcc2
+	@if [ -f $(PREFIX)/lib/liblz4.a ]; then \
+	    echo "(skipping: liblz4.a already installed)"; \
+	else \
+	    $(call compress-unpack,lz4) && \
+	    $(CROSS_ENV) make -j$(NPROC) -C lib liblz4.a && \
+	    $(CROSS_ENV) make -C lib install PREFIX=$(PREFIX) BUILD_SHARED=no && \
+	    rm -rf $(BUILD)/lz4; \
+	fi
+	$(call compress-gate,lz4,lz4.h,lz4,puts(LZ4_versionString()))
+
+lzo: gcc2
+	@if [ -f $(PREFIX)/lib/liblzo2.a ]; then \
+	    echo "(skipping: liblzo2.a already installed)"; \
+	else \
+	    $(call compress-unpack,lzo) && \
+	    $(CROSS_ENV) ./configure --host=x86_64-gnu --build=x86_64-pc-linux-gnu \
+	        --prefix=$(PREFIX) --disable-shared --enable-static && \
+	    $(CROSS_ENV) make -j$(NPROC) src/liblzo2.la && \
+	    $(CROSS_ENV) make install-libLTLIBRARIES install-pkgincludeHEADERS \
+	        install-pkgconfigDATA && \
+	    rm -rf $(BUILD)/lzo; \
+	fi
+	$(call compress-gate,lzo,lzo/lzo1x.h,lzo2,if (lzo_init() != LZO_E_OK) return 1)
+
 # 9pfs calls two RPC stubs directly: exec_exec_paths (file-exec-paths.c,
 # from libhurduser) and mach_port_move_member (io-reauthenticate.c, from
 # libmachuser). libc NEEDs both DSOs, so the loader finds them at run time;
@@ -656,7 +784,7 @@ toolchain: 3p-pin Dockerfile.hurd-x86_64-gnu docker-stages.sh
 binutils gcc1 gcc2 gnumach mig glibc: toolchain
 	@echo "stages $@ are run by the container above (binutils -> gcc2, incl. MIG)"
 
-hurd libpciaccess 9pfs verify-vm: toolchain
+hurd libpciaccess compress-libs 9pfs verify-vm: toolchain
 	@echo "stage $@ is not implemented in the docker backend yet;"
 	@echo "run it host-local: make -C toolchain $@ BACKEND=hostlocal"
 	@echo "(MIG, the Hurd headers and glibc are installed in the prefix;"
