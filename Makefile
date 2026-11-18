@@ -114,6 +114,7 @@ LOCK_FILE     := $(IMG_DIR)/.build.lock
 .PHONY: run-smp-tests run-up-tests smp-image up-image
 .PHONY: virtio-clean gnumach-clean
 .PHONY: fs-translators exfatfs exfatfs-clean exfatfs-test
+.PHONY: compress-libs
 
 # The default builds the whole image pipeline, with every intermediate
 # exposed as its own qcow2 (see the stage rules below).
@@ -350,6 +351,7 @@ virtio-blk: fetch-3p    ; $(MAKE) -C toolchain virtio-blk VIRTIO_DIR=$(VIRTIO_DI
 virtio-net: fetch-3p    ; $(MAKE) -C toolchain virtio-net VIRTIO_DIR=$(VIRTIO_NET_DIR)
 virtio-clean: fetch-3p ; $(MAKE) -C toolchain virtio-clean VIRTIO_DIR=$(VIRTIO_DIR)
 storeio: fetch-3p       ; $(MAKE) -C toolchain storeio
+compress-libs: fetch-3p ; $(MAKE) -C toolchain compress-libs
 # HURD_TREE: the Hurd source tree the in-tree filesystem translators are
 # built from.  FS: the filesystems to build and test; each <fs> other than
 # exfat needs the translator <fs>fs in HURD_TREE.  exfatfs comes from its
