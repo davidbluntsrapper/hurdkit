@@ -29,6 +29,15 @@
   fs_image_test.py lookups ROOT      a missing name gives ENOENT; ".." at
                                      ROOT leads to ROOT's parent
   fs_image_test.py mmap FILE...      print sha256 of each FILE read via mmap
+  fs_image_test.py stat-names DIR NAME...
+                                     print NAME<TAB>found, or the errno
+                                     name, for each NAME looked up in DIR
+  fs_image_test.py statvfs-flags PATH
+                                     print the ST_* flags statvfs gives
+  fs_image_test.py stat-storm SECS PROCS PATH...
+                                     PROCS processes stat random PATHs for
+                                     SECS seconds; print the count of stats
+                                     and of each errno
   fs_image_test.py mount-walk TRANSLATOR MNTROOT TIMEOUT IMAGE...
                                      (Hurd guest) mount each IMAGE, walk it,
                                      check the translator is still alive;
@@ -47,11 +56,13 @@ A regular file larger than SAMPLE_OVER is hashed over fixed sample
 regions (sha256 "sampled:..."), so a sparse file of many GiB is checked
 without reading all of it.
 """
+import errno
 import hashlib
 import os
 import random
 import stat
 import sys
+import time
 
 # Fixed timestamps, even seconds so FAT's 2 s resolution can hold them too.
 MTIME_FILE = 1622550896   # 2021-06-01 12:34:56 UTC
@@ -477,6 +488,55 @@ def mmap_hashes(files):
     return 0
 
 
+def stat_names(d, names):
+    for name in names:
+        try:
+            os.lstat(os.path.join(d, name))
+            print(f"{name}\tfound")
+        except OSError as e:
+            print(f"{name}\t{errno.errorcode.get(e.errno, e.errno)}")
+    return 0
+
+
+# By name, as each system numbers them its own way.
+STATVFS_FLAGS = ("ST_RDONLY", "ST_NOSUID", "ST_NODEV", "ST_NOEXEC", "ST_SYNCHRONOUS",
+                 "ST_MANDLOCK", "ST_WRITE", "ST_APPEND", "ST_IMMUTABLE",
+                 "ST_NOATIME", "ST_NODIRATIME", "ST_RELATIME")
+
+
+def statvfs_flags(path):
+    flags = os.statvfs(path).f_flag
+    print(" ".join(n for n in STATVFS_FLAGS if flags & getattr(os, n, 0)) or "none")
+    return 0
+
+
+def _storm(args):
+    seed, secs, paths = args
+    rng = random.Random(seed)
+    end = time.time() + secs
+    count, errors = 0, {}
+    while time.time() < end:
+        try:
+            os.lstat(rng.choice(paths))
+        except OSError as e:
+            name = errno.errorcode.get(e.errno, str(e.errno))
+            errors[name] = errors.get(name, 0) + 1
+        count += 1
+    return count, errors
+
+
+def stat_storm(secs, procs, paths):
+    import multiprocessing
+    with multiprocessing.Pool(procs) as pool:
+        results = pool.map(_storm, [(i, secs, paths) for i in range(procs)])
+    errors = {}
+    for _, e in results:
+        for k, v in e.items():
+            errors[k] = errors.get(k, 0) + v
+    print(f"stats={sum(c for c, _ in results)} errors={errors}")
+    return 0
+
+
 def mount_walk(translator, mntroot, timeout, images):
     """Guest side of the fuzz check.  Each image gets its own mount point,
     so a translator that hangs does not block the next image.  A result
@@ -638,6 +698,12 @@ def main(argv):
         return lookups(argv[2])
     if len(argv) >= 3 and argv[1] == "mmap":
         return mmap_hashes(argv[2:])
+    if len(argv) >= 4 and argv[1] == "stat-names":
+        return stat_names(argv[2], argv[3:])
+    if len(argv) == 3 and argv[1] == "statvfs-flags":
+        return statvfs_flags(argv[2])
+    if len(argv) >= 5 and argv[1] == "stat-storm":
+        return stat_storm(float(argv[2]), int(argv[3]), argv[4:])
     if len(argv) >= 6 and argv[1] == "mount-walk":
         return mount_walk(argv[2], argv[3], argv[4], argv[5:])
     if len(argv) >= 4 and argv[1] == "compare":
