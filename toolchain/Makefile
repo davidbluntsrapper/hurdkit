@@ -439,44 +439,51 @@ libirqhelp: hurd mig
 	@echo "=== gate: libirqhelp ==="
 	ls $(PREFIX)/lib/libirqhelp.so $(PREFIX)/include/hurd/irqhelp.h >/dev/null
 
+# Copy a Hurd source tree and configure the copy out of tree for x86_64-gnu,
+# the way the `hurd` stage does: $(1) is the source tree, $(2) the build
+# directory, and the copy lands in $(2)-src.  Both are recreated on every
+# call, so a build never depends on what an earlier one left behind.  The
+# translators built below need generated headers (libstore/store.h,
+# libnetfs/fs_S.h, version.h) that only a configured tree has; a standalone
+# `make -C 3p/hurd/<dir>` fails without them.  Ends inside $(2) with PATH
+# and CPATH pointing at the prefix.
+define hurd-configure
+rm -rf $(2)-src $(2) && \
+	cp -a $(1) $(2)-src && \
+	sed -i -e '/^if test "x$$cross_compiling" = "xyes"; then$$/,/^fi$$/d' $(2)-src/configure.ac && \
+	(cd $(2)-src && autoreconf -i) && \
+	mkdir -p $(2) && cd $(2) && \
+	export PATH=$(PREFIX)/bin:$$PATH CPATH=$(PREFIX)/include && \
+	CC=$(PREFIX)/bin/x86_64-gnu-gcc MIG=$(PREFIX)/bin/mig \
+	CPPFLAGS="-I$(PREFIX)/include" LDFLAGS="-L$(PREFIX)/lib" \
+	$(2)-src/configure \
+	    --host=x86_64-gnu --build=x86_64-pc-linux-gnu --prefix=$(PREFIX) \
+	    --without-parted --without-libtirpc --without-libdaemon \
+	    --without-rump --without-acpica --without-libcrypt --disable-profile && \
+	make version.h
+endef
+
+# Fail unless each argument is a GNU/Hurd ELF.
+define hurd-elf-gate
+for f in $(1); do \
+	    file $$f; \
+	    file $$f | grep -q 'for GNU/Hurd' || { echo "$$f: not a GNU/Hurd ELF" >&2; exit 1; }; \
+	done
+endef
+
 # storeio is not installed to the prefix by the `hurd` stage, so it has its
-# own target. It builds inside a configured out-of-tree Hurd tree (a
-# standalone `make -C 3p/hurd/storeio` fails: generated headers such as
-# libstore/store.h, libnetfs/fs_S.h, version.h and libhurdbugaddr.a are
-# missing).  Libs are built in dependency order:
-#   libshouldbeinlibc -> libihash -> libiohelp -> libports -> libpager ->
-#   libfshelp -> libnetfs -> libstore -> libhurdbugaddr -> storeio.
+# own target.  Libs are built in dependency order.
 # The hurdkit-branch fix (commit e07e9590) fixes the --no-cache byte-to-block
 # conversion (<< instead of >>) in storeio/dev.c.
 storeio: hurd mig
-	rm -rf $(BUILD)/hurd-src $(BUILD)/hurd && \
-	cp -a $(REPO_ROOT)/3p/hurd $(BUILD)/hurd-src && \
-	cd $(BUILD)/hurd-src && \
-	sed -i -e '/^if test "x$$cross_compiling" = "xyes"; then$$/,/^fi$$/d' configure.ac && \
-	autoreconf -i && \
-	mkdir -p $(BUILD)/hurd && cd $(BUILD)/hurd && \
-	    PATH=$(PREFIX)/bin:$$PATH \
-	    CC=$(PREFIX)/bin/x86_64-gnu-gcc MIG=$(PREFIX)/bin/mig \
-	    CPPFLAGS="-I$(PREFIX)/include" LDFLAGS="-L$(PREFIX)/lib" CPATH=$(PREFIX)/include \
-	    $(BUILD)/hurd-src/configure \
-	        --host=x86_64-gnu --build=x86_64-pc-linux-gnu --prefix=$(PREFIX) \
-	        --without-parted --without-libtirpc --without-libdaemon \
-	        --without-rump --without-acpica --without-libcrypt --disable-profile && \
-	    sed -e 's/MASTER_HURD_VERSION/"$(shell sed -n "s/^package-version := //p" $(BUILD)/hurd/config.make)"/' \
-	        < $(BUILD)/hurd-src/version.h.in > $(BUILD)/hurd/version.h && \
-	    PATH=$(PREFIX)/bin:$$PATH make -C libshouldbeinlibc -j$(NPROC) && \
-	    PATH=$(PREFIX)/bin:$$PATH make -C libihash -j$(NPROC) && \
-	    PATH=$(PREFIX)/bin:$$PATH make -C libiohelp -j$(NPROC) && \
-	    PATH=$(PREFIX)/bin:$$PATH make -C libports -j$(NPROC) && \
-	    PATH=$(PREFIX)/bin:$$PATH make -C libpager -j$(NPROC) && \
-	    PATH=$(PREFIX)/bin:$$PATH make -C libfshelp -j$(NPROC) && \
-	    PATH=$(PREFIX)/bin:$$PATH make -C libnetfs -j$(NPROC) && \
-	    PATH=$(PREFIX)/bin:$$PATH make -C libstore -j$(NPROC) && \
-	    PATH=$(PREFIX)/bin:$$PATH make -C libhurdbugaddr -j$(NPROC) && \
-	    PATH=$(PREFIX)/bin:$$PATH make -C storeio storeio.static
+	$(call hurd-configure,$(REPO_ROOT)/3p/hurd,$(BUILD)/hurd) && \
+	for d in libshouldbeinlibc libihash libiohelp libports libpager libfshelp \
+	         libnetfs libstore libhurdbugaddr; do \
+	    make -C $$d -j$(NPROC) || exit 1; \
+	done && \
+	make -C storeio storeio.static
 	@echo "=== gate: storeio ==="
-	file $(BUILD)/hurd/storeio/storeio.static
-	file $(BUILD)/hurd/storeio/storeio.static | grep -q 'for GNU/Hurd' || { echo "storeio: binary is not a GNU/Hurd ELF" >&2; exit 1; }
+	$(call hurd-elf-gate,$(BUILD)/hurd/storeio/storeio.static)
 
 # 9pfs calls two RPC stubs directly: exec_exec_paths (file-exec-paths.c,
 # from libhurduser) and mach_port_move_member (io-reauthenticate.c, from
