@@ -25,7 +25,7 @@ SSH_PORT ?= 2222
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp storeio virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp storeio fs-translators virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -474,6 +474,32 @@ storeio: hurd mig
 	make -C storeio storeio.static
 	@echo "=== gate: storeio ==="
 	$(call hurd-elf-gate,$(BUILD)/hurd/storeio/storeio.static)
+
+# Static libdiskfs translators from HURD_TREE (default: the pinned 3p/hurd),
+# for the filesystem harness (scripts/exfatfs_test.sh).  Static, so they run
+# in the guest whatever Hurd libraries the Debian image ships.  The output
+# is $(BUILD)/hurd-translators/<name>/<name>.static.  The pinned 3p/hurd
+# has fatfs but not yet exfatfs, which comes with hurdkit/hurd's exfatfs
+# change: build exfatfs with HURD_TREE set to a tree that has it.
+HURD_TREE      ?= $(REPO_ROOT)/3p/hurd
+FS_TRANSLATORS ?= fatfs exfatfs
+# Checked when make reads this file, so a missing translator stops the
+# build before any stage runs rather than after the configure.
+ifneq ($(filter fs-translators,$(MAKECMDGOALS)),)
+FS_MISSING := $(strip $(foreach t,$(FS_TRANSLATORS),$(if $(wildcard $(abspath $(HURD_TREE))/$(t)/Makefile),,$(t))))
+ifneq ($(FS_MISSING),)
+$(error HURD_TREE=$(abspath $(HURD_TREE)) has no $(FS_MISSING) translator. exfatfs needs a Hurd tree with the exfatfs translator (hurdkit/hurd's exfatfs change, not yet in the pinned 3p/hurd): pass HURD_TREE=<that tree>, or FS=fat to test the fatfs control alone)
+endif
+endif
+fs-translators: hurd mig
+	$(call hurd-configure,$(abspath $(HURD_TREE)),$(BUILD)/hurd-translators) && \
+	for d in libhurdbugaddr libshouldbeinlibc libihash libiohelp libports \
+	         libpager libfshelp libstore libdiskfs; do \
+	    make -C $$d -j$(NPROC) || exit 1; \
+	done && \
+	for t in $(FS_TRANSLATORS); do make -C $$t -j$(NPROC) $$t.static || exit 1; done
+	@echo "=== gate: fs-translators ==="
+	$(call hurd-elf-gate,$(foreach t,$(FS_TRANSLATORS),$(BUILD)/hurd-translators/$(t)/$(t).static))
 
 # 9pfs calls two RPC stubs directly: exec_exec_paths (file-exec-paths.c,
 # from libhurduser) and mach_port_move_member (io-reauthenticate.c, from
