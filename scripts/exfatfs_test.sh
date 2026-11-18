@@ -48,50 +48,9 @@ SSH_KEY="${SSH_KEY_DIR:-$REPO_ROOT/img/keys}/root_ed25519"
 TMP_DIR="$REPO_ROOT/img/tmp"
 WORK="$TMP_DIR/exfatfs-test"
 TOOL="$SCRIPT_DIR/fs_image_test.py"
-FAILED=0
-PASSES=()
-FAILS=()
-GUEST_UP=0
-
-for f in "$BASE_IMG" "$SSH_KEY"; do
-    [[ -f "$f" ]] || { echo "exfatfs-test: missing $f (make packages)" >&2; exit 1; }
-done
-
-pass() { PASSES+=("$1"); echo "exfatfs-test: PASS $1"; }
-fail() { FAILS+=("$1"); FAILED=1; echo "exfatfs-test: FAIL $1"; }
-finish() {
-    echo
-    echo "exfatfs-test: ${#PASSES[@]} passed, ${#FAILS[@]} failed"
-    for f in "${FAILS[@]}"; do echo "  FAIL $f"; done
-    if [[ "$REUSE" == 1 && "$FAILED" == 0 ]]; then
-        echo "exfatfs-test: REUSE=1; guest left running"
-    fi
-    exit "$FAILED"
-}
-
-# $WORK/mnt is the only host mount point.  A loop mount left there by an
-# aborted run would make rm -rf "$WORK" delete the files inside the image.
-unmount_work() {
-    if mountpoint -q "$WORK/mnt" 2>/dev/null; then
-        sudo umount "$WORK/mnt"
-    fi
-}
-# Any non-zero exit after the guest is up is a failure, so the guest is
-# kept for inspection.  vt_cleanup exits, so it runs last.
-on_exit() {
-    local rc=$?
-    unmount_work || echo "exfatfs-test: could not unmount $WORK/mnt" >&2
-    if [[ "$GUEST_UP" == 1 ]]; then
-        [[ $rc -eq 0 ]] || FAILED=1
-        vt_cleanup "$FAILED" "$REUSE"
-    fi
-    exit "$rc"
-}
-trap on_exit EXIT
-
-unmount_work
-rm -rf "$WORK"
-mkdir -p "$WORK/mnt"
+FT_NAME="exfatfs-test"
+source "$SCRIPT_DIR/fs_test_lib.sh"
+ft_prepare_work
 
 bins=()
 for fs in $FS; do
@@ -158,55 +117,7 @@ for fs in $FS; do
     esac
 done
 
-VT_NAME="exfatfs-test"
-VT_TMP_DIR="$TMP_DIR"
-VT_QEMU_LOG="$TMP_DIR/exfatfs-test-qemu.log"
-VT_PIDFILE="$TMP_DIR/exfatfs-test-qemu.pid"
-VT_SSH_HOST="$SSH_HOST"
-VT_SSH_PORT="$SSH_PORT"
-VT_SSH_KEY="$SSH_KEY"
-VT_BASE_IMG="$BASE_IMG"
-VT_TRACE=""
-VT_RERUN_HINT="rerun the checks against it with: REUSE=1 make exfatfs-test; or stop it with: /bin/kill \$(cat $VT_PIDFILE)"
-source "$SCRIPT_DIR/virtio_boot_lib.sh"
-vt_check_pidfile "$REUSE"
-if [[ "$REUSE" == 1 ]]; then
-    if ! vt_ssh_alive; then
-        echo "exfatfs-test: REUSE=1 but no guest answers on port $VT_SSH_PORT" >&2
-        echo "  boot one first (without REUSE) or leave a failed run's QEMU running" >&2
-        exit 1
-    fi
-    GUEST_UP=1
-    echo "exfatfs-test: reusing the guest already running on port $VT_SSH_PORT"
-else
-    GUEST_UP=1
-    vt_make_overlay
-    echo "exfatfs-test: booting the guest..."
-    vt_boot
-fi
-
-ssh_opts=(-i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-          -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=20
-          -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
-# Every guest step runs under a timeout: a hung translator must fail its
-# check, not hang the run.
-bounded() {
-    local rc=0
-    timeout -k 10 "$GUEST_TIMEOUT" "$@" || rc=$?
-    if [[ $rc -eq 124 ]]; then
-        echo "exfatfs-test: timed out after ${GUEST_TIMEOUT}s: ${*: -1}" >&2
-    fi
-    return "$rc"
-}
-g() { bounded ssh -n "${ssh_opts[@]}" -p "$VT_SSH_PORT" root@"$SSH_HOST" "$@"; }
-# An active translator inherits settrans's stdout and stderr, and ssh waits
-# for every holder of its channel to close it, so a successful mount would
-# never return.  Route settrans through a guest-side log instead.
-mount_fs() {
-    g "settrans -ac $1 $2 ${4---readonly} -T file $3 </dev/null >/tmp/settrans.log 2>&1; rc=\$?; cat /tmp/settrans.log; exit \$rc"
-}
-put() { bounded scp -q "${ssh_opts[@]}" -P "$VT_SSH_PORT" "$@" root@"$SSH_HOST":/tmp/; }
-get() { bounded scp -q "${ssh_opts[@]}" -P "$VT_SSH_PORT" root@"$SSH_HOST":"$1" "$2"; }
+ft_boot
 
 # A reused guest may still run translators from the failed run, some on
 # the binaries about to be overwritten.  Clear every mount point first.
