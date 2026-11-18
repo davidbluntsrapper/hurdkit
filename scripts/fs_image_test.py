@@ -4,23 +4,48 @@
   fs_image_test.py tree DIR          write the deterministic test tree
   fs_image_test.py fragment ROOT     leave a fragmented file in a mounted image
   fs_image_test.py mutate ROOT       apply the write test's operations
-  fs_image_test.py manifest ROOT     print one line per path under ROOT
-  fs_image_test.py compare A B [--content-only]
+  fs_image_test.py manifest ROOT [--no-mtime] [--full]
+                                     print one line per path under ROOT
+  fs_image_test.py compare A B [--content-only] [--ignore FIELDS]
                                      diff two manifests; exit 1 on mismatch.
                                      --content-only drops paths and compares
                                      the multiset of type/size/sha256 (for a
                                      translator that rewrites names, like
-                                     fatfs serving only 8.3 short names)
+                                     fatfs serving only 8.3 short names).
+                                     --ignore (full manifests) blanks the
+                                     comma-separated fields, each FIELD or
+                                     TYPE:FIELD (d:size: directories only)
+  fs_image_test.py walk ROOT         read every entry, count errors, never
+                                     fail (for corrupt images)
+  fs_image_test.py xattrs ROOT       print every extended attribute
+  fs_image_test.py erofs ROOT FILE DIR
+                                     every write on a read-only mount must
+                                     fail with EROFS
+  fs_image_test.py lookups ROOT      a missing name gives ENOENT; ".." at
+                                     ROOT leads to ROOT's parent
+  fs_image_test.py mmap FILE...      print sha256 of each FILE read via mmap
+  fs_image_test.py mount-walk TRANSLATOR MNTROOT TIMEOUT IMAGE...
+                                     (Hurd guest) mount each IMAGE, walk it,
+                                     check the translator is still alive;
+                                     one result line per image
 
 A manifest line is  type<TAB>size<TAB>mtime<TAB>sha256<TAB>path  with the
 path relative to ROOT, sorted, so the host's view of an image (through an
 independent implementation) and the guest's (through the translator under
 test) compare line by line.  The same file runs on both sides, so the
 format cannot drift.
+
+--full adds the root (".") and every file type, and the columns of
+FULL_FIELDS: permission bits including setuid, setgid and sticky, owner,
+link count, device numbers, symlink target, inode number and st_blocks.
+A regular file larger than SAMPLE_OVER is hashed over fixed sample
+regions (sha256 "sampled:..."), so a sparse file of many GiB is checked
+without reading all of it.
 """
 import hashlib
 import os
 import random
+import stat
 import sys
 
 # Fixed timestamps, even seconds so FAT's 2 s resolution can hold them too.
@@ -216,6 +241,266 @@ def manifest(root, mtimes=True):
     return sorted(lines, key=lambda l: l.split("\t", 4)[4])
 
 
+FULL_FIELDS = ("type", "size", "mtime", "sha256", "mode", "uid", "gid",
+               "nlink", "rdev", "target", "ino", "blocks", "path")
+SAMPLE_OVER = 1 << 30
+SAMPLE_LEN = 64 * 1024
+SAMPLE_STEP = 256 * 1024 * 1024
+
+
+def _sha256(path, size):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        if size <= SAMPLE_OVER:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+            return h.hexdigest()
+        offsets = list(range(0, size, SAMPLE_STEP)) + [size - SAMPLE_LEN]
+        for off in offsets:
+            f.seek(off)
+            h.update(f.read(SAMPLE_LEN))
+    return "sampled:" + h.hexdigest()
+
+
+def _type(mode):
+    for test, t in ((stat.S_ISDIR, "d"), (stat.S_ISREG, "f"), (stat.S_ISLNK, "l"),
+                    (stat.S_ISCHR, "c"), (stat.S_ISBLK, "b"), (stat.S_ISFIFO, "p"),
+                    (stat.S_ISSOCK, "s")):
+        if test(mode):
+            return t
+    return "?"
+
+
+def full_entry(path, rel):
+    """One FULL_FIELDS record (a dict) for PATH, from lstat."""
+    st = os.lstat(path)
+    t = _type(st.st_mode)
+    return {
+        "type": t,
+        "size": str(st.st_size),
+        "mtime": str(int(st.st_mtime)),
+        "sha256": _sha256(path, st.st_size) if t == "f" else "-",
+        "mode": "%04o" % stat.S_IMODE(st.st_mode),
+        "uid": str(st.st_uid),
+        "gid": str(st.st_gid),
+        "nlink": str(st.st_nlink),
+        "rdev": "%d,%d" % (os.major(st.st_rdev), os.minor(st.st_rdev)) if t in "cb" else "-",
+        "target": os.readlink(path).replace("\t", "\\t") if t == "l" else "-",
+        "ino": str(st.st_ino),
+        "blocks": str(st.st_blocks),
+        "path": rel,
+    }
+
+
+def format_full(entry):
+    return "\t".join(entry[k] for k in FULL_FIELDS)
+
+
+def parse_full(line):
+    return dict(zip(FULL_FIELDS, line.split("\t")))
+
+
+def full_manifest(root):
+    lines = [format_full(full_entry(root, "."))]
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(n for n in dirnames if len(os.fsencode(n)) <= NAME_MAX)
+        filenames = [n for n in filenames if len(os.fsencode(n)) <= NAME_MAX]
+        for name in dirnames + sorted(filenames):
+            path = os.path.join(dirpath, name)
+            lines.append(format_full(full_entry(path, os.path.relpath(path, root))))
+    return sorted(lines, key=lambda l: l.rsplit("\t", 1)[1])
+
+
+def walk(root):
+    """Visit every entry the way a reader would and count what fails.
+    For corrupt images: the result is the counts, never an exception."""
+    entries = errors = 0
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            names = os.listdir(d)
+        except OSError as e:
+            errors += 1
+            print(f"walk: listdir {d}: {e}")
+            continue
+        for name in names:
+            path = os.path.join(d, name)
+            entries += 1
+            try:
+                st = os.lstat(path)
+                if stat.S_ISDIR(st.st_mode):
+                    stack.append(path)
+                elif stat.S_ISREG(st.st_mode):
+                    with open(path, "rb") as f:
+                        while f.read(1 << 20):
+                            pass
+                elif stat.S_ISLNK(st.st_mode):
+                    os.readlink(path)
+            except OSError as e:
+                errors += 1
+                if errors <= 20:
+                    print(f"walk: {path}: {e}")
+    print(f"walk: entries={entries} errors={errors}")
+    return 0
+
+
+def xattrs(root):
+    """Lines of path, name, length and sha256 of the value, sorted."""
+    if not hasattr(os, "listxattr"):
+        print("xattrs: this Python has no os.listxattr")
+        return 1
+    lines = []
+    paths = [root]
+    for dirpath, dirnames, filenames in os.walk(root):
+        paths += [os.path.join(dirpath, n) for n in dirnames + filenames]
+    for path in paths:
+        rel = os.path.relpath(path, root)
+        for name in os.listxattr(path, follow_symlinks=False):
+            value = os.getxattr(path, name, follow_symlinks=False)
+            lines.append(f"{rel}\t{name}\t{len(value)}\t{hashlib.sha256(value).hexdigest()}")
+    print("\n".join(sorted(lines)))
+    return 0
+
+
+def erofs(root, file, dir):
+    """FILE and DIR are an existing file and directory under ROOT."""
+    import errno
+    j = lambda p: os.path.join(root, p)
+    ops = {
+        "create": lambda: os.close(os.open(j("new-file"), os.O_CREAT | os.O_WRONLY, 0o644)),
+        "open for write": lambda: os.close(os.open(j(file), os.O_WRONLY)),
+        "truncate": lambda: os.truncate(j(file), 0),
+        "unlink": lambda: os.unlink(j(file)),
+        "chmod": lambda: os.chmod(j(file), 0o600),
+        "chown": lambda: os.chown(j(file), 1, 1),
+        "utime": lambda: os.utime(j(file), (0, 0)),
+        "rename": lambda: os.rename(j(file), j("renamed")),
+        "link": lambda: os.link(j(file), j("new-link")),
+        "symlink": lambda: os.symlink("x", j("new-symlink")),
+        "mkdir": lambda: os.mkdir(j("new-dir")),
+        "rmdir": lambda: os.rmdir(j(dir)),
+        "mkfifo": lambda: os.mkfifo(j("new-fifo")),
+    }
+    bad = 0
+    for name, op in ops.items():
+        try:
+            op()
+            print(f"erofs: {name}: succeeded")
+            bad += 1
+        except OSError as e:
+            if e.errno != errno.EROFS:
+                print(f"erofs: {name}: {errno.errorcode.get(e.errno, e.errno)}, not EROFS")
+                bad += 1
+    print(f"erofs: {len(ops) - bad} of {len(ops)} writes refused with EROFS")
+    return 1 if bad else 0
+
+
+def lookups(root):
+    import errno
+    bad = 0
+    for missing in ("no-such-name", "blocks/no-such-name", "no-such-dir/x"):
+        try:
+            os.lstat(os.path.join(root, missing))
+            print(f"lookups: {missing}: exists")
+            bad += 1
+        except OSError as e:
+            if e.errno != errno.ENOENT:
+                print(f"lookups: {missing}: {errno.errorcode.get(e.errno)}, not ENOENT")
+                bad += 1
+    def same(a, b):
+        try:
+            sa, sb = os.stat(a), os.stat(b)
+        except OSError as e:
+            print(f"lookups: {e}")
+            return False
+        return (sa.st_ino, sa.st_dev) == (sb.st_ino, sb.st_dev)
+    parent = os.path.dirname(os.path.abspath(root))
+    if not same(os.path.join(root, ".."), parent):
+        print(f"lookups: {root}/.. is not {parent}")
+        bad += 1
+    subdirs = [n for n in sorted(os.listdir(root))
+               if os.path.isdir(os.path.join(root, n)) and not os.path.islink(os.path.join(root, n))]
+    if not subdirs:
+        print("lookups: the root has no subdirectory to check .. from")
+        bad += 1
+    for sub in subdirs:
+        if not same(os.path.join(root, sub, ".."), root):
+            print(f"lookups: {sub}/.. is not the root")
+            bad += 1
+    print("lookups: ok" if not bad else f"lookups: {bad} wrong")
+    return 1 if bad else 0
+
+
+def mmap_hashes(files):
+    import mmap
+    for path in files:
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            if size == 0:
+                digest = hashlib.sha256(b"").hexdigest()
+            else:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+                    digest = hashlib.sha256(m).hexdigest()
+        print(f"{digest}\t{path}")
+    return 0
+
+
+def mount_walk(translator, mntroot, timeout, images):
+    """Guest side of the fuzz check.  Each image gets its own mount point,
+    so a translator that hangs does not block the next image.  A result
+    line is  image<TAB>outcome<TAB>detail  with outcome one of: refused
+    (the translator's own message, non-zero exit), served (mounted, walked,
+    still alive), crash (no own message, or dead after the walk), hang (a
+    step timed out)."""
+    import subprocess
+    timeout = int(timeout)
+    prefix = translator + ": "
+    def run(cmd):
+        try:
+            p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, timeout=timeout)
+            return p.returncode, p.stdout.decode(errors="replace")
+        except subprocess.TimeoutExpired:
+            return None, "timed out"
+    for image in images:
+        name = os.path.basename(image)
+        mnt = os.path.join(mntroot, name)
+        os.makedirs(mnt, exist_ok=True)
+        # The active translator inherits settrans's output, so a pipe
+        # would never close on a successful mount; use a file.
+        log = mnt + ".log"
+        with open(log, "w") as f:
+            try:
+                rc = subprocess.run(["settrans", "-ac", mnt, translator, "--readonly",
+                                     "-T", "file", image], stdin=subprocess.DEVNULL,
+                                    stdout=f, stderr=subprocess.STDOUT, timeout=timeout).returncode
+            except subprocess.TimeoutExpired:
+                rc = None
+        with open(log, errors="replace") as f:
+            out = f.read()
+        one = " ".join(out.split())[:200]
+        if rc is None:
+            print(f"{name}\thang\tsettrans: {one}", flush=True)
+            continue
+        if rc != 0:
+            ok = prefix in out and "Assertion" not in out and "signal" not in out
+            print(f"{name}\t{'refused' if ok else 'crash'}\t{one}", flush=True)
+            continue
+        rc, out = run([sys.executable, os.path.abspath(__file__), "walk", mnt])
+        if rc is None:
+            print(f"{name}\thang\twalk", flush=True)
+            continue
+        walked = out.strip().splitlines()[-1] if out.strip() else "no output"
+        rc, out = run(["fsysopts", mnt])
+        if rc != 0:
+            print(f"{name}\tcrash\tdead after the walk ({walked}); fsysopts: {' '.join(out.split())[:100]}", flush=True)
+            continue
+        run(["settrans", "-g", mnt])
+        print(f"{name}\tserved\t{walked}", flush=True)
+    return 0
+
+
 def copy(src, dst):
     """cp -a, minus names past NAME_MAX, which a Linux directory can't hold."""
     import shutil
@@ -224,11 +509,28 @@ def copy(src, dst):
     shutil.copytree(src, dst, symlinks=True, ignore=ignore, dirs_exist_ok=True)
 
 
-def compare(a_path, b_path, content_only=False):
+def _blank(lines, ignore):
+    """Replace the ignored fields of full manifest lines by "*"."""
+    out = []
+    for line in lines:
+        e = parse_full(line)
+        for item in ignore:
+            t, _, field = item.rpartition(":")
+            if field not in FULL_FIELDS:
+                raise SystemExit(f"compare: unknown field {field}")
+            if not t or e["type"] == t:
+                e[field] = "*"
+        out.append(format_full(e))
+    return out
+
+
+def compare(a_path, b_path, content_only=False, ignore=()):
     with open(a_path) as f:
         a = f.read().splitlines()
     with open(b_path) as f:
         b = f.read().splitlines()
+    if ignore:
+        a, b = _blank(a, ignore), _blank(b, ignore)
     if content_only:
         a = sorted(l.rsplit("\t", 1)[0] for l in a)
         b = sorted(l.rsplit("\t", 1)[0] for l in b)
@@ -264,10 +566,29 @@ def main(argv):
         mutate(argv[2])
         return 0
     if len(argv) >= 3 and argv[1] == "manifest":
-        print("\n".join(manifest(argv[2], mtimes="--no-mtime" not in argv)))
+        if "--full" in argv:
+            print("\n".join(full_manifest(argv[2])))
+        else:
+            print("\n".join(manifest(argv[2], mtimes="--no-mtime" not in argv)))
         return 0
-    if len(argv) in (4, 5) and argv[1] == "compare":
-        return compare(argv[2], argv[3], content_only="--content-only" in argv)
+    if len(argv) == 3 and argv[1] == "walk":
+        return walk(argv[2])
+    if len(argv) == 3 and argv[1] == "xattrs":
+        return xattrs(argv[2])
+    if len(argv) == 5 and argv[1] == "erofs":
+        return erofs(argv[2], argv[3], argv[4])
+    if len(argv) == 3 and argv[1] == "lookups":
+        return lookups(argv[2])
+    if len(argv) >= 3 and argv[1] == "mmap":
+        return mmap_hashes(argv[2:])
+    if len(argv) >= 6 and argv[1] == "mount-walk":
+        return mount_walk(argv[2], argv[3], argv[4], argv[5:])
+    if len(argv) >= 4 and argv[1] == "compare":
+        ignore = ()
+        if "--ignore" in argv:
+            ignore = argv[argv.index("--ignore") + 1].split(",")
+        return compare(argv[2], argv[3], content_only="--content-only" in argv,
+                       ignore=ignore)
     print(__doc__, file=sys.stderr)
     return 2
 
