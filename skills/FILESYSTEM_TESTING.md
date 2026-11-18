@@ -21,7 +21,7 @@ make exfatfs-test REUSE=1                          # rerun against a failed run'
 
 fatfs is built from `HURD_TREE`, by default the pinned `3p/hurd`.
 exfatfs is built from its own repo,
-[exfatfs](https://github.com/davidbluntsrapper/exfatfs), checked out at
+[exfatfs](https://github.com/hurdkit/exfatfs), checked out at
 `EXFATFS_DIR`.
 
 The run ends with `exfatfs-test: N passed, M failed` and exits non-zero on
