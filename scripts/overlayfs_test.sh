@@ -46,7 +46,7 @@ FAULT_SET="${FAULT_SET:-ext2-2}"
 FAULT_STEPS="${FAULT_STEPS:-}"
 # Only the plan's runs whose SET.MODE.SCENARIO matches PLAN (a grep -E
 # pattern), for debugging; a filtered run is not an acceptance run.
-PLAN="${PLAN:-.}"
+export PLAN="${PLAN:-.}"
 REUSE="${REUSE:-0}"
 GUEST_TIMEOUT="${GUEST_TIMEOUT:-600}"
 BASE_IMG="${BASE_IMG:-$REPO_ROOT/img/hurd.packages.qcow2}"
@@ -74,6 +74,10 @@ ft_prepare_work
 stage() { [[ " $STAGES " == *" $1 "* ]]; }
 TIMES="$WORK/times.tsv"
 : > "$TIMES"
+# skipped WHAT: a step this system does not run, printed now and again
+# above the summary.
+SKIPS=()
+skipped() { SKIPS+=("$1"); echo "$FT_NAME: SKIPPED $1"; }
 # check_result NAME STATUS SECONDS [DETAIL]: pass or fail NAME and keep
 # how long it took, so a red run shows how fast each check fails.
 check_result() {
@@ -150,7 +154,7 @@ while IFS=$'\t' read -r set mode scen _stage plain; do
     check_result "control: $key agrees with Linux, up to the listed differences" "$rc" $((SECONDS - t0)) \
         "$(grep -v 'allowed\|^check' "$WORK/control/$key.cmp" 2>/dev/null | head -8 | tr '\n\t' '  ')"
     [[ $rc == 0 ]] || ctl_fail=1
-done < <(python3 "$OPS" plan | awk -F'\t' -v p="$PLAN" '($1 "." $2 "." $3) ~ p')
+done < <(python3 "$OPS" plan | awk -F'\t' '($1 "." $2 "." $3) ~ ENVIRON["PLAN"]')
 g "rm -rf /tmp/ovl/plain" || true
 if [[ $ctl_fail == 1 ]]; then
     fail "translator: not judged, the control failed"
@@ -212,9 +216,13 @@ judge_run() {
         return
     fi
     rc=0
-    g "upper=\$(cat /tmp/ovl/$key/upper-path); python3 $G/overlayfs_ops.py run $scen /tmp/ovl/$key/mnt $([[ $mode == rw ]] && echo '--upper $upper')" \
-        > "$log.log" 2> "$log.err" || rc=$?
     tags="overlay,strict,hurd$(tags_for "$set")"
+    g "upper=\$(cat /tmp/ovl/$key/upper-path); python3 $G/overlayfs_ops.py run $scen /tmp/ovl/$key/mnt --tags $tags $([[ $mode == rw ]] && echo '--upper $upper')" \
+        > "$log.log" 2> "$log.err" || rc=$?
+    # A step this system cannot run is never silent.
+    while IFS=$'\t' read -r step label res; do
+        skipped "$key step $step $label: ${res%%: ok*}"
+    done < <(awk -F'\t' '$3 ~ /^skipped \(/' "$log.log")
     python3 "$OPS" compare "$scen" "$LX/$key.log" "$log.log" --tags "$tags" > "$log.cmp" || true
     local secs=$((SECONDS - t0))
     for c in $checks; do
@@ -243,7 +251,7 @@ judge_run() {
         if [[ $rc == 0 ]] && g "$GH mount $key" > "$log.remount" 2>&1; then
             g "python3 $G/overlayfs_ops.py run persist /tmp/ovl/$key/mnt" > "$log.persist.log" 2>&1 || rc=1
             g "$GH unmount $key" >/dev/null 2>&1 || rc=1
-            python3 "$OPS" compare persist "$LX/$key.persist.log" "$log.persist.log" --tags "$tags" \
+            python3 "$OPS" compare persist "$LX/$key.persist.log" "$log.persist.log" --tags "$tags" --after "$scen" \
                 > "$log.persist.cmp" || rc=1
         else
             rc=1
@@ -263,7 +271,7 @@ while IFS=$'\t' read -r set mode scen _ _; do
     if [[ $mode == ro ]]; then stage 1 || continue; else stage 2 || continue; fi
     echo "$FT_NAME: $set.$mode.$scen"
     judge_run "$set" "$mode" "$scen"
-done < <(python3 "$OPS" plan | awk -F'\t' -v p="$PLAN" '($1 "." $2 "." $3) ~ p')
+done < <(python3 "$OPS" plan | awk -F'\t' '($1 "." $2 "." $3) ~ ENVIRON["PLAN"]')
 
 # The checks that read one mounted overlay rather than compare a log.
 if stage 1; then
@@ -435,4 +443,5 @@ except OSError as e: print(e.strerror)' $M/\$p; done; ls -a $M $M/d | grep -c 'w
             "${bad[*]:0:5}${silent[0]+; never fired at N=1: ${silent[*]:0:20}}"
     fi
 fi
+for x in "${SKIPS[@]}"; do echo "$FT_NAME: SKIPPED $x"; done
 finish

@@ -11,12 +11,13 @@ directory, so the record format cannot drift between them.
   overlayfs_ops.py mount-args
         print the bad invocations and hostile layouts: name, must, setup,
         options, during (see MOUNT_ARGS)
-  overlayfs_ops.py run SCENARIO ROOT [--upper DIR] [--steps A:B] [--final-manifest]
+  overlayfs_ops.py run SCENARIO ROOT [--upper DIR] [--steps A:B] [--final-manifest] [--tags T1,T2]
         run SCENARIO against ROOT (a mount point or a plain directory) and
         print one record per step.  --upper names the overlay's upper
         directory, for the statfs step.  --steps runs steps A to B-1 only;
-        --final-manifest adds a manifest of ROOT as step 99
-  overlayfs_ops.py compare SCENARIO LINUX_LOG OTHER_LOG --tags T1,T2 [--set SET]
+        --final-manifest adds a manifest of ROOT as step 99; --tags are the
+        compare tags of the system, which pick the steps it runs instead
+  overlayfs_ops.py compare SCENARIO LINUX_LOG OTHER_LOG --tags T1,T2 [--after SCENARIO]
         compare a log with the Linux log of the same scenario and set,
         allowing exactly the per-step differences the scenario lists for
         the tags (plain: the plain-directory control; overlay: the
@@ -66,15 +67,22 @@ import overlayfs_layers as L  # noqa: E402
 START = time.time()
 
 
-def S(op, *args, diff=None, ignore=None, why="", check=None):
+def S(op, *args, diff=None, ignore=None, why="", check=None, instead=None):
     """A step.  DIFF {tags: result} is the result a system with all of
     TAGS ("plain", or "hurd+tmpfs-upper") gives instead of Linux's; None
-    allows any result.  IGNORE {tag: (path, ...)} names the paths whose
+    allows any result.  IGNORE {tags: (path, ...)} names the paths whose
     manifest lines that system no longer compares from this step on, and
     WHY the reason, which the compare output quotes.  CHECK names the
-    brief's check the step belongs to (default: by op, see CHECK_OF)."""
+    brief's check the step belongs to (default: by op, see CHECK_OF).
+    INSTEAD {tags: (op, *args)} is the step a system with TAGS runs in
+    place of this one, because this one cannot run there; the record
+    says "skipped" with WHY and the harness prints it."""
     return {"op": op, "args": args, "diff": diff or {}, "ignore": ignore or {}, "why": why,
-            "check": check}
+            "check": check, "instead": instead or {}}
+
+
+def has_tags(key, tags):
+    return all(t in tags for t in key.split("+"))
 
 
 # The brief's stage-1 check each read step belongs to.
@@ -101,6 +109,9 @@ HL_NLINK = "Linux reports a copied-up name's st_nlink as 1 and the other name's 
 MAP_COPYUP = ("a plain file is one inode, so the mapping sees the write; Linux keeps a mapping "
               "made before copy-up on the lower file (F3)")
 WH_EPERM = "Linux refuses to create a 0:0 character device (it is the whiteout)"
+TMPFS_TRUNC = ("a shrinking truncate to a non-zero size on the Hurd's tmpfs panics gnumach "
+               "(vm_map_copyin_page_list: m->wire_count == 1), with no overlay involved; "
+               "the file is opened for writing instead, so it is still copied up")
 
 READ_STEPS = [
     S("manifest", "."),
@@ -134,7 +145,9 @@ SCENARIOS = {
         S("write", "new-file", "created\n"), S("read", "new-file"),
         S("append", "medium", "appended\n"), S("read", "medium"),
         S("open", "big2m", "WRONLY|TRUNC"), S("stat", "big2m"),
-        S("truncate", "both", 3), S("read", "both"),
+        S("truncate", "both", 3, instead={"hurd+tmpfs-upper": ("open", "both", "WRONLY")},
+          ignore={"hurd+tmpfs-upper": ("both",)}, why=TMPFS_TRUNC),
+        S("read", "both", diff={"hurd+tmpfs-upper": None}, why=TMPFS_TRUNC),
         S("chmod", "ro644", 0o600), S("stat", "ro644"),
         S("chown", "old", 1000, 1000), S("stat", "old"),
         S("utime", "future", 1000000000), S("stat", "future"),
@@ -637,9 +650,10 @@ def run_step(root, step, upper):
     return "ok" if r is None else r
 
 
-def run(name, root, upper=None, steps=None, final_manifest=False):
+def run(name, root, upper=None, steps=None, final_manifest=False, tags=()):
     """STEPS (start, stop) runs only those steps (the fault sweep);
-    FINAL_MANIFEST adds a manifest of the whole tree as step 99."""
+    FINAL_MANIFEST adds a manifest of the whole tree as step 99.  TAGS
+    are the system's compare tags, which pick a step's INSTEAD."""
     sc = SCENARIOS[name]
     if sc.get("user"):
         os.setgroups([])
@@ -660,11 +674,16 @@ def run(name, root, upper=None, steps=None, final_manifest=False):
             except OSError as e:
                 print(f"{i:02d}\t{label}\t{ename(e)}")
             continue
+        alt = [v for k, v in step["instead"].items() if has_tags(k, tags)]
+        prefix = ""
+        if alt:
+            prefix = f"skipped ({step['why']}); ran {' '.join(str(x) for x in alt[0])}: "
+            step = S(*alt[0])
         try:
             r = run_step(root, step, upper)
         except OSError as e:
             r = ename(e)
-        print(f"{i:02d}\t{label}\t{r}", flush=True)
+        print(f"{i:02d}\t{label}\t{prefix}{r}", flush=True)
     return 0
 
 
@@ -679,20 +698,28 @@ def _parse(path):
     return steps
 
 
+# Fields a system with all of TAGS never compares, as TYPE:FIELD, with
+# the reason.  Every manifest line they hide a difference in is printed.
 GLOBAL_IGNORE = {
-    # A merged directory has st_nlink 1 on Linux (I6); a plain one counts
-    # its subdirectories.
-    "plain": ("d:nlink",),
+    "plain": (("d:nlink", "a merged directory has st_nlink 1 on Linux (I6); a plain one "
+                          "counts its subdirectories"),),
+    "hurd+tmpfs-upper": (("d:mtime", "the Hurd's tmpfs never updates a directory's mtime when "
+                                     "an entry is added or removed (measured on a bare tmpfs)"),),
 }
+FIELD_COL = {"nlink": 4, "mtime": 5}
+
+
+def _global_ignores(tags):
+    return [g for k, v in GLOBAL_IGNORE.items() if has_tags(k, tags) for g in v]
 
 
 def _blank_manifest_line(line, ignores):
     path, rest = line.split("\t", 1)[1].split("\t", 1)
     cols = rest.split("\t")
-    for item in ignores:
+    for item, _ in ignores:
         t, _, fld = item.partition(":")
-        if cols[0] == t and fld == "nlink":
-            cols[4] = "*"
+        if cols[0] == t:
+            cols[FIELD_COL[fld]] = "*"
     return "M\t" + path + "\t" + "\t".join(cols)
 
 
@@ -729,25 +756,28 @@ def _strict(op, args, want, hidden):
     return want
 
 
-def compare(name, a_path, b_path, tags):
+def compare(name, a_path, b_path, tags, after=None):
     """Exit status 0 when the logs agree up to the scenario's listed
     differences for TAGS.  Prints each difference it allowed and each it
-    did not."""
+    did not.  AFTER names the scenario that ran before this one on the
+    same tree (persist), whose ignored paths stay ignored."""
     sc = SCENARIOS[name]
     a, b = _parse(a_path), _parse(b_path)
     if not a:
         print(f"compare: {a_path} is empty; refusing to call that a match")
         return 1
-    gign = [g for t in tags for g in GLOBAL_IGNORE.get(t, ())]
+    gign = _global_ignores(tags)
     hidden = _listed_unstatable(a) if "strict" in tags else set()
-    ignored = []
+    ignored = [p for st in (SCENARIOS[after]["steps"] if after else ())
+               for k, v in st["ignore"].items() if has_tags(k, tags) for p in v]
     bad = 0
     verdict = {}
     for i, step in enumerate(sc["steps"]):
         chk = check_of(name, step)
         verdict.setdefault(chk, "pass")
-        for t in tags:
-            ignored += step["ignore"].get(t, ())
+        for k, v in step["ignore"].items():
+            if has_tags(k, tags):
+                ignored += v
         la, lb = a.get(i, []), b.get(i, [])
         if step["op"] == "manifest" and la and la[0].startswith("M\t"):
             def keep(line):
@@ -755,8 +785,14 @@ def compare(name, a_path, b_path, tags):
                 if p == "!" and line.split("\t")[2].split(":")[0] in hidden:
                     return False
                 return p not in hidden and not any(p == x or p.startswith(x + "/") for x in ignored)
-            la = [_blank_manifest_line(x, gign) for x in la if keep(x)]
-            lb = [_blank_manifest_line(x, gign) for x in lb if x.startswith("M\t") and keep(x)]
+            la, lb = [x for x in la if keep(x)], [x for x in lb if x.startswith("M\t") and keep(x)]
+            if la != lb and gign:
+                for x in sorted(set(lb) - set(la))[:30]:
+                    if _blank_manifest_line(x, gign) in {_blank_manifest_line(y, gign) for y in la}:
+                        print(f"step {i:02d} manifest: allowed difference "
+                              f"({'; '.join(w for _, w in gign)}): other {x}")
+            la = [_blank_manifest_line(x, gign) for x in la]
+            lb = [_blank_manifest_line(x, gign) for x in lb]
             if la != lb:
                 bad += 1
                 verdict[chk] = "fail"
@@ -778,8 +814,11 @@ def compare(name, a_path, b_path, tags):
                 print(f"step {i:02d} {label}: allowed difference (Linux lists a whiteout that "
                       f"lookup hides, D9): linux {want}, other {got}")
                 continue
-        allowed = [v for k, v in step["diff"].items() if all(t in tags for t in k.split("+"))]
+        allowed = [v for k, v in step["diff"].items() if has_tags(k, tags)]
         if got == want:
+            continue
+        if got.startswith("skipped (") and any(has_tags(k, tags) for k in step["instead"]):
+            print(f"step {i:02d} {label}: SKIPPED on this system: linux {want}, other {got}")
             continue
         if allowed and (allowed[0] is None or got == allowed[0]):
             print(f"step {i:02d} {label}: allowed difference ({step['why']}): linux {want}, other {got}")
@@ -1084,9 +1123,10 @@ def main(argv):
         steps = _opt(argv, "--steps")
         return run(argv[2], argv[3], _opt(argv, "--upper"),
                    tuple(int(x) for x in steps.split(":")) if steps else None,
-                   "--final-manifest" in argv)
+                   "--final-manifest" in argv, (_opt(argv, "--tags") or "").split(","))
     if cmd == "compare" and len(argv) >= 5:
-        return compare(argv[2], argv[3], argv[4], (_opt(argv, "--tags") or "").split(","))
+        return compare(argv[2], argv[3], argv[4], (_opt(argv, "--tags") or "").split(","),
+                       _opt(argv, "--after"))
     if cmd == "upper-state" and len(argv) >= 3:
         print("\n".join(upper_state(argv[2], _opt(argv, "--convention"))))
         return 0

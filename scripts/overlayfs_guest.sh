@@ -121,12 +121,14 @@ unmount)
     d=$R/$2
     # The no-senders notifications for ports a finished client held come
     # in later, so a first EBUSY right after a run can be transient.
-    for i in 1 2 3 4 5; do
+    for i in $(seq 25); do
         settrans -gR "$d/mnt" 2>/dev/null && break
-        sleep 1
+        sleep 0.2
     done
     settrans -gR "$d/mnt" 2>/dev/null; rc=$?
-    left=$(ps -eo pid,args | awk -v m="$d/" 'index($0, m) && !/awk|squashfs.static|hurd\/tmpfs/')
+    # Only the translator itself: a shell whose command line names the
+    # mount point (ssh's bash -c) is not one.
+    left=$(ps -eo pid,args | awk -v m="$d/" 'index($0, m) && $2 ~ /ovl-translator|ovl-fault|unionfs|env-wrapper/')
     if [[ -n $left ]]; then echo "translator still running: $left"; exit 1; fi
     exit $rc
     ;;
