@@ -18,6 +18,11 @@
   fs_image_test.py walk ROOT         read every entry, count errors, never
                                      fail (for corrupt images)
   fs_image_test.py xattrs ROOT       print every extended attribute
+  fs_image_test.py hurd-dev IN OUT   IN with device numbers as the Hurd's
+                                     dev_t holds them; print those that
+                                     do not fit
+  fs_image_test.py xattrs-from-probe FILE
+                                     the same, from fs_probe xattrs output
   fs_image_test.py erofs ROOT FILE DIR
                                      every write on a read-only mount must
                                      fail with EROFS
@@ -262,6 +267,17 @@ def _sha256(path, size):
     return "sampled:" + h.hexdigest()
 
 
+def _readlink(path, size):
+    """os.readlink, except that Python on the Hurd reads at most 1024
+    bytes (its MAXPATHLEN); readlink(1) has no such limit."""
+    target = os.readlink(path)
+    if len(os.fsencode(target)) < size:
+        import subprocess
+        out = subprocess.run(["readlink", path], stdout=subprocess.PIPE, check=True).stdout
+        target = os.fsdecode(out[:-1] if out.endswith(b"\n") else out)
+    return target
+
+
 def _type(mode):
     for test, t in ((stat.S_ISDIR, "d"), (stat.S_ISREG, "f"), (stat.S_ISLNK, "l"),
                     (stat.S_ISCHR, "c"), (stat.S_ISBLK, "b"), (stat.S_ISFIFO, "p"),
@@ -285,7 +301,7 @@ def full_entry(path, rel):
         "gid": str(st.st_gid),
         "nlink": str(st.st_nlink),
         "rdev": "%d,%d" % (os.major(st.st_rdev), os.minor(st.st_rdev)) if t in "cb" else "-",
-        "target": os.readlink(path).replace("\t", "\\t") if t == "l" else "-",
+        "target": _readlink(path, st.st_size).replace("\t", "\\t") if t == "l" else "-",
         "ino": str(st.st_ino),
         "blocks": str(st.st_blocks),
         "path": rel,
@@ -342,6 +358,21 @@ def walk(root):
                 if errors <= 20:
                     print(f"walk: {path}: {e}")
     print(f"walk: entries={entries} errors={errors}")
+    return 0
+
+
+def xattrs_from_probe(probe_out):
+    """fs_probe xattrs output, in the form xattrs() prints."""
+    lines = []
+    with open(probe_out, errors="surrogateescape") as f:
+        for line in f.read().splitlines():
+            path, name, value = line.split("\t", 2)
+            if name == "!" or value.startswith("!"):
+                lines.append(line)
+                continue
+            v = bytes.fromhex(value)
+            lines.append(f"{path}\t{name}\t{len(v)}\t{hashlib.sha256(v).hexdigest()}")
+    print("\n".join(sorted(lines)))
     return 0
 
 
@@ -524,6 +555,28 @@ def _blank(lines, ignore):
     return out
 
 
+def hurd_dev(in_path, out_path):
+    """Copy the full manifest IN_PATH to OUT_PATH with each device number
+    as the Hurd's dev_t holds it: glibc on the Hurd keeps an 8-bit major
+    number and a minor number without its bits 8 to 15 (mmmmMMmm).  Print
+    the entries whose number does not fit, which no translator can show
+    as Linux does."""
+    out = []
+    with open(in_path) as f:
+        for line in f.read().splitlines():
+            e = parse_full(line)
+            if e["rdev"] != "-":
+                major, minor = (int(x) for x in e["rdev"].split(","))
+                held = f"{major & 0xff},{minor & 0xffff00ff}"
+                if held != e["rdev"]:
+                    print(f"{e['path']}\t{e['rdev']}\t{held}")
+                    e["rdev"] = held
+            out.append(format_full(e))
+    with open(out_path, "w") as f:
+        f.write("".join(l + "\n" for l in out))
+    return 0
+
+
 def compare(a_path, b_path, content_only=False, ignore=()):
     with open(a_path) as f:
         a = f.read().splitlines()
@@ -575,6 +628,10 @@ def main(argv):
         return walk(argv[2])
     if len(argv) == 3 and argv[1] == "xattrs":
         return xattrs(argv[2])
+    if len(argv) == 4 and argv[1] == "hurd-dev":
+        return hurd_dev(argv[2], argv[3])
+    if len(argv) == 3 and argv[1] == "xattrs-from-probe":
+        return xattrs_from_probe(argv[2])
     if len(argv) == 5 and argv[1] == "erofs":
         return erofs(argv[2], argv[3], argv[4])
     if len(argv) == 3 and argv[1] == "lookups":

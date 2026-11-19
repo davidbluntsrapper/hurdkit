@@ -37,8 +37,8 @@ static compression libraries, with headers and `.pc` files, for
 translators that decompress (squashfs). Each stage downloads a pinned
 release tarball into `~/work/x86_64-gnu-src`, checks its sha256 against
 the value in the Makefile, and gates on a static GNU/Hurd program that
-links the library. It is not part of `make toolchain`; `fs-translators`
-runs it when squashfs is requested.
+links the library. It is not part of `make toolchain`. The `squashfs`
+target runs it first.
 
 The 3p sources the toolchain builds against (`mig`, `glibc`, `gnumach`,
 `hurd`, `9pfs`, `libpciaccess`) are pinned to the exact commits that were
