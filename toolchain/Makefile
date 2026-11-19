@@ -25,7 +25,7 @@ SSH_PORT ?= 2222
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch compress-libs zlib xz zstd lz4 lzo binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp libdiskfs storeio fs-translators exfatfs squashfs virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch compress-libs zlib xz zstd lz4 lzo binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp libdiskfs libnetfs storeio fs-translators exfatfs squashfs virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -452,6 +452,25 @@ libdiskfs: hurd mig
 	ls $(PREFIX)/lib/libdiskfs.a $(PREFIX)/lib/libstore.a \
 	    $(PREFIX)/lib/libstore_device.a $(PREFIX)/lib/libhurdbugaddr.a \
 	    $(PREFIX)/include/hurd/diskfs.h $(PREFIX)/include/hurd/store.h >/dev/null
+
+# libnetfs is not installed by the `hurd` stage either.  The standalone
+# overlayfs translator links it from the prefix.
+libnetfs: hurd mig
+	@if ls $(PREFIX)/lib/libnetfs.a >/dev/null 2>&1; then \
+	    echo "(skipping: libnetfs already installed)"; \
+	else \
+	    $(call hurd-configure,$(REPO_ROOT)/3p/hurd,$(BUILD)/hurd-netfs) && \
+	    for d in libhurdbugaddr libshouldbeinlibc libihash libiohelp libports \
+	             libfshelp libnetfs; do \
+	        make -C $$d -j$(NPROC) || exit 1; \
+	    done && \
+	    for d in libhurdbugaddr libnetfs; do \
+	        make -C $$d install || exit 1; \
+	    done; \
+	fi
+	@echo "=== gate: libnetfs ==="
+	ls $(PREFIX)/lib/libnetfs.a $(PREFIX)/lib/libnetfs.so \
+	    $(PREFIX)/include/hurd/netfs.h >/dev/null
 
 # Copy a Hurd source tree and configure the copy out of tree for x86_64-gnu,
 # the way the `hurd` stage does: $(1) is the source tree, $(2) the build
