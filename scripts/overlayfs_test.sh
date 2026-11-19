@@ -41,9 +41,12 @@ STAGES="${STAGES:-1 2}"
 ORACLE_ONLY="${ORACLE_ONLY:-0}"
 STRESS_SECS="${STRESS_SECS:-60}"
 FAULT_MAX="${FAULT_MAX:-200}"
-FAULT_SCENARIOS="${FAULT_SCENARIOS:-copyup remove rename create}"
+# The default sweep takes one step of each kind of change (about 40
+# minutes); FAULT_SCENARIOS="copyup remove rename create" FAULT_BUDGET=0
+# sweeps every step (about 2 hours 10 minutes).
+FAULT_SCENARIOS="${FAULT_SCENARIOS:-copyup:0,2,6,18,27,30 remove:0,4,8,14,22,25 rename:0,3,16,20,28 create:0,3,8,12}"
 FAULT_SET="${FAULT_SET:-ext2-2}"
-FAULT_STEPS="${FAULT_STEPS:-}"
+FAULT_BUDGET="${FAULT_BUDGET:-2700}"
 # Only the plan's runs whose SET.MODE.SCENARIO matches PLAN (a grep -E
 # pattern), for debugging; a filtered run is not an acceptance run.
 export PLAN="${PLAN:-.}"
@@ -364,83 +367,36 @@ except OSError as e: print(e.strerror)' $M/\$p; done; ls -a $M $M/d | grep -c 'w
     fi
     g "$GH teardown $key" >/dev/null 2>&1 || true
 
-    # fault_case SCEN STEP MODE N: one fault-sweep case on FAULT_SET.  The
-    # prefix of SCEN runs on the real translator; STEP runs on the fault
-    # build with OVERLAYFS_FAULT=MODE:N; the view during and after a
-    # remount must be the view before STEP or after it.  Prints the
-    # outcome: ok-before, ok-after, notfired, or bad: WHY.  The fault
-    # build says it injected by printing "OVERLAYFS_FAULT fired" on its
-    # stderr; the sweep of one step ends at the first N that does not.
-    # While the fault build runs it is /tmp/ovl-translator, and the real
-    # one is /tmp/ovl-translator.real.
-    fault_case() {
-        local scen=$1 k=$2 fm=$3 n=$4 key="fault" d=/tmp/ovl/fault fw="$WORK/fault"
-        g "$GH prepare $FAULT_SET rw $key" >/dev/null 2>&1 || { echo "bad: prepare"; return; }
-        if [[ $k -gt 0 ]]; then
-            g "$GH mount $key >/dev/null && python3 $G/overlayfs_ops.py run $scen $d/mnt --steps 0:$k >/dev/null; $GH unmount $key" \
-                >/dev/null 2>&1 || { echo "bad: the prefix failed on the real translator"; return; }
-        fi
-        g "cp $G/ovl-translator $G/ovl-translator.real && cp $G/ovl-fault $G/ovl-translator" || { echo "bad: swap"; return; }
-        local mrc=0
-        g "$GH mount $key OVERLAYFS_FAULT=$fm:$n" > "$fw/mount.log" 2>&1 || mrc=$?
-        g "cp $G/ovl-translator.real $G/ovl-translator" || true
-        [[ $mrc == 0 ]] || { echo "bad: the fault build did not mount: $(tr '\n' ' ' < "$fw/mount.log")"; return; }
-        g "python3 $G/overlayfs_ops.py run $scen $d/mnt --steps $k:$((k + 1)) --final-manifest" > "$fw/observed.log" 2>&1 || true
-        g "cat $d/mnt.log" > "$fw/stderr.log" 2>&1 || true
-        g "$GH unmount $key || settrans -fg $d/mnt" >/dev/null 2>&1 || true
-        local fired=0
-        grep -q "OVERLAYFS_FAULT fired" "$fw/stderr.log" && fired=1
-        if ! g "$GH mount $key" >/dev/null 2>&1; then echo "bad: the next mount failed"; return; fi
-        g "python3 $G/overlayfs_ops.py run persist $d/mnt --steps 0:0 --final-manifest" > "$fw/remount.log" 2>&1 || true
-        g "$GH unmount $key" >/dev/null 2>&1 || true
-        local lc=0; g "$GH lowers-unchanged $key" >/dev/null 2>&1 || lc=1
-        local v1 v2
-        v1=$(python3 "$OPS" view-class "$fw/before.log" "$fw/after.log" "$fw/observed.log")
-        v2=$(python3 "$OPS" view-class "$fw/before.log" "$fw/after.log" "$fw/remount.log")
-        if [[ $lc == 1 ]]; then echo "bad: a lower changed"
-        elif [[ $v1 == mixed || $v2 == mixed ]]; then echo "bad: mixed view (during: $v1, after remount: $v2)"
-        elif [[ $fired == 0 ]]; then echo "notfired"
-        else echo "ok-$v2"; fi
-    }
+    # The fault sweep runs in the guest in one session (overlayfs_guest.sh
+    # fault-sweep), so a case costs no ssh; each case's line comes back as
+    # it ends.  A case is bad when a lower changed, the next mount
+    # failed, the work directory kept a file, or a view is "mixed"
+    # (overlayfs_ops.py view-class).  The sweep of one step ends at the
+    # first N that does not fire.
     t0=$SECONDS
     if [[ -z "$OVERLAYFS_FAULT_BIN" || ! -f "$OVERLAYFS_FAULT_BIN" ]]; then
-        check_result "fault-sweep: fail and exit at every layer mutation of every scenario step" 1 0 \
+        check_result "fault-sweep: fail and exit at every layer mutation of the swept steps" 1 0 \
             "OVERLAYFS_FAULT_BIN='$OVERLAYFS_FAULT_BIN' does not exist"
     else
         mkdir -p "$WORK/fault"
         cp "$OVERLAYFS_FAULT_BIN" "$WORK/ovl-fault"
         chmod 755 "$WORK/ovl-fault"
         put "$WORK/ovl-fault"
-        bad=()
-        cases=0
-        fired=0
-        silent=()
-        for scen in $FAULT_SCENARIOS; do
-            for k in ${FAULT_STEPS:-$(python3 "$OPS" mutating "$scen")}; do
-                # The two whole states: before STEP and after it, on the
-                # real translator.
-                g "$GH prepare $FAULT_SET rw fault && $GH mount fault >/dev/null && python3 $G/overlayfs_ops.py run $scen /tmp/ovl/fault/mnt --steps 0:$k --final-manifest" \
-                    > "$WORK/fault/before.log" 2>&1 || true
-                g "python3 $G/overlayfs_ops.py run $scen /tmp/ovl/fault/mnt --steps $k:$((k + 1)) --final-manifest; $GH unmount fault" \
-                    > "$WORK/fault/after.log" 2>&1 || true
-                for fm in fail exit; do
-                    for ((n = 1; n <= FAULT_MAX; n++)); do
-                        cases=$((cases + 1))
-                        r=$(fault_case "$scen" "$k" "$fm" "$n")
-                        printf '%s\t%s\t%s\t%s\t%s\n' "$scen" "$k" "$fm" "$n" "$r" >> "$WORK/fault/results.tsv"
-                        [[ $r == bad:* ]] && bad+=("$scen step $k $fm:$n: $r")
-                        [[ $r == ok-* ]] && fired=$((fired + 1))
-                        [[ $r == notfired && $n == 1 ]] && silent+=("$scen:$k:$fm")
-                        [[ $r == notfired || $r == bad:* ]] && break
-                    done
-                done
-            done
-        done
-        # A step that fails before it changes a layer (EEXIST, say) never
-        # fires, but a sweep in which nothing fires tested nothing.
-        check_result "fault-sweep: fail and exit at every layer mutation of every scenario step ($cases cases, $fired fired)" \
-            "$([[ ${#bad[@]} == 0 && $fired -gt 0 ]]; echo $?)" $((SECONDS - t0)) \
-            "${bad[*]:0:5}${silent[0]+; never fired at N=1: ${silent[*]:0:20}}"
+        R="$WORK/fault/results.tsv"
+        # A case past the budget is not begun, and none takes 15 minutes.
+        GUEST_TIMEOUT=$(( FAULT_BUDGET > 0 ? FAULT_BUDGET + 900 : 86400 )) g "FAULT_MAX=$FAULT_MAX $GH fault-sweep $FAULT_SET $FAULT_BUDGET $FAULT_SCENARIOS" \
+            > "$R" 2> "$WORK/fault/sweep.err" || true
+        summary=$(python3 "$OPS" fault-summary "$R")
+        IFS=$'\t' read -r counts nbad nfired done budget detail <<< "$summary"
+        [[ $budget == - ]] && budget=
+        [[ $detail == - ]] && detail=
+        rc=0
+        [[ $nbad == 0 && $nfired -gt 0 && $done == 1 && -z $budget ]] || rc=1
+        [[ $done == 1 ]] || detail="the sweep did not finish ($(tail -2 "$WORK/fault/sweep.err" | tr '\n' ' '))${detail:+; $detail}"
+        [[ -z $budget ]] || detail="FAULT_BUDGET=${FAULT_BUDGET}s ran out; not swept:$budget${detail:+; $detail}"
+        [[ $nfired -gt 0 ]] || detail="no case fired: the sweep tested nothing${detail:+; $detail}"
+        check_result "fault-sweep: fail and exit at every layer mutation of $FAULT_SCENARIOS on $FAULT_SET ($counts)" \
+            "$rc" $((SECONDS - t0)) "$detail"
     fi
 fi
 for x in "${SKIPS[@]}"; do echo "$FT_NAME: SKIPPED $x"; done

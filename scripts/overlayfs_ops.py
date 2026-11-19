@@ -36,10 +36,15 @@ directory, so the record format cannot drift between them.
   overlayfs_ops.py checks SCENARIO
         print the names of the brief's checks SCENARIO covers
   overlayfs_ops.py mutating SCENARIO
-        print the index of each step that changes the tree (fault sweep)
-  overlayfs_ops.py view-class BEFORE AFTER OBSERVED
-        print before, after or mixed: which state the OBSERVED manifest
-        record is (fault sweep)
+        print the index of each step that changes the tree and how the
+        fault sweep judges it, atomic or compound (see FAULT_JUDGE)
+  overlayfs_ops.py view-class BEFORE AFTER OBSERVED [--judge atomic|compound]
+                   [--fired LINE] [--lowers DIR...]
+        print which state the OBSERVED manifest is: before, after,
+        before+copyup, after+copyup, between (compound only) or
+        mixed: WHY (fault sweep)
+  overlayfs_ops.py fault-summary RESULTS
+        summarize the fault sweep's result lines for the harness
   overlayfs_ops.py fault-selftest DIR
         prove view-class on states made by hand in DIR
 
@@ -979,69 +984,248 @@ def stress(root, secs, procs, write):
     return 0 if not unexpected and not errs and not lost else 1
 
 
-MUTATING = {"open", "write", "append", "truncate", "chmod", "chown", "lchown", "utime", "unlink",
-            "rmdir", "mkdir", "rmtree", "rename", "symlink", "link", "mkfifo", "mknod",
-            "editor-save", "open-across-copy-up"}
+# How the fault sweep judges a step that changes the tree, by op.  An
+# "atomic" op makes one visible change, maybe after an invisible copy-up,
+# so a failed or cut-short one must leave the view before or after it.
+# A "compound" op makes several visible changes one after another (create
+# then fill; write a temporary then rename; one unlink per entry), so a
+# view between them is legitimate: it must keep every name before and
+# after share, keep those names' unchanged entries unchanged, and show no
+# lower name that both hide.
+FAULT_JUDGE = {
+    "open": "atomic", "append": "atomic", "truncate": "atomic", "chmod": "atomic",
+    "chown": "atomic", "lchown": "atomic", "utime": "atomic", "unlink": "atomic",
+    "rmdir": "atomic", "mkdir": "atomic", "rename": "atomic", "symlink": "atomic",
+    "link": "atomic", "mkfifo": "atomic", "mknod": "atomic", "open-across-copy-up": "atomic",
+    "write": "compound", "editor-save": "compound", "rmtree": "compound",
+}
 
 
 def mutating(name):
     for i, step in enumerate(SCENARIOS[name]["steps"]):
-        if step["op"] in MUTATING and not (step["op"] == "open" and step["args"][1] == "RDONLY"):
-            print(i)
+        if step["op"] in FAULT_JUDGE and not (step["op"] == "open" and step["args"][1] == "RDONLY"):
+            print(f"{i}\t{FAULT_JUDGE[step['op']]}")
     return 0
 
 
-def view_class(before, after, observed):
-    """For the fault sweep: an operation that failed or was cut short must
-    leave the whole view as it was before or as it is after; anything else
-    is a mix that lost a name or showed a deleted one."""
-    def load(p):
-        with open(p) as fh:
-            return sorted(l.split("\t", 2)[2] for l in fh.read().splitlines() if "\tM\t" in l)
-    b, a, o = load(before), load(after), load(observed)
-    if o == b:
-        return "before"
-    if o == a:
-        return "after"
-    return "mixed"
+# Manifest columns after the path: type mode owner size nlink mtime sha rdev target.
+TYPE, NLINK, MTIME = 0, 4, 5
+
+
+def _manifest(path):
+    """{path: fields} of the manifest records in a log, "!" lines kept."""
+    out = {}
+    with open(path, errors="surrogateescape") as fh:
+        for line in fh.read().splitlines():
+            if "\tM\t" in line:
+                p, _, rest = line.split("\t", 2)[2].partition("\t")
+                out[p if p != "!" else "! " + rest] = rest.split("\t")
+    return out
+
+
+def _copyup_trace(ref, got, utimens_fired):
+    """None when entry GOT is entry REF, "copyup" when it differs only as
+    an interrupted copy-up leaves it, else what differs.  A copy-up that
+    stops part way leaves the parent chain or the source in upper, as
+    Linux does: a lower-only directory then reports st_nlink 1 (a merged
+    directory, I6), and a copied-up name of a lower hard link 1 while its
+    other name keeps the lower count (H4).  A directory's mtime may also
+    read "new", but only when the injected fault hit a file_utimens: the
+    copy-up sets a directory's own times after it is renamed into place
+    and restores its parent's times after that, both best effort (as
+    Linux restores the parent's), so a fault there leaves the time that
+    the rename gave."""
+    if ref == got:
+        return None
+    if len(ref) != len(got) or ref[TYPE] != got[TYPE]:
+        return "type or error"
+    trace = False
+    for c, (x, y) in enumerate(zip(ref, got)):
+        if x == y:
+            continue
+        if c == NLINK and y == "1" and ref[TYPE] in ("d", "f"):
+            trace = True
+        elif c == MTIME and y == "new" and ref[TYPE] == "d" and utimens_fired:
+            trace = True
+        else:
+            return COLS[c]
+    return "copyup" if trace else None
+
+
+COLS = ["type", "mode", "owner", "size", "nlink", "mtime", "data", "rdev", "target"]
+
+
+def _same_view(ref, got, utimens_fired):
+    """"" when GOT is REF, "+copyup (PATH FIELDS, ...)" when it is REF up
+    to copy-up traces, None for a different view."""
+    if ref.keys() != got.keys():
+        return None
+    traces = {p: _copyup_trace(ref[p], got[p], utimens_fired) for p in ref}
+    if set(traces.values()) <= {None}:
+        return ""
+    if not set(traces.values()) <= {None, "copyup"}:
+        return None
+    return "+copyup (" + ", ".join(
+        p + " " + "+".join(COLS[c] for c, (x, y) in enumerate(zip(ref[p], got[p])) if x != y)
+        for p in sorted(traces) if traces[p]) + ")"
+
+
+def view_class(before, after, observed, judge="atomic", fired="", lower_roots=()):
+    """For the fault sweep: which state the OBSERVED manifest is.  An
+    atomic step's view must be BEFORE or AFTER, exactly or up to an
+    interrupted copy-up ("before+copyup", "after+copyup", see
+    _copyup_trace).  A compound step's other views are "between" when
+    they keep what both states keep and show no lower name both hide.
+    Anything else is "mixed: WHY".  FIRED is the mutation the fault hit
+    (the fault build's "fired" line); LOWER_ROOTS the lower layers (a list)
+    or the set of their paths."""
+    b, a, o = _manifest(before), _manifest(after), _manifest(observed)
+    if not o:
+        return "mixed: no manifest"
+    ut = "file_utimens" in fired
+    for name, ref in (("before", b), ("after", a)):
+        same = _same_view(ref, o, ut)
+        if same is not None:
+            return name + same
+    if judge != "compound":
+        diff = [f"lost {p}" for p in sorted(b.keys() - o.keys())] + \
+               [f"new {p}" for p in sorted(o.keys() - b.keys())] + \
+               [f"{p} {t}" for p in sorted(b.keys() & o.keys())
+                for t in [_copyup_trace(b[p], o[p], ut)] if t not in (None, "copyup")]
+        return "mixed: against before: " + "; ".join(diff[:4])
+    lost = sorted(p for p in b.keys() & a.keys() if p not in o)
+    if lost:
+        return f"mixed: lost {lost[:3]}"
+    names = lower_paths(lower_roots) if isinstance(lower_roots, (list, tuple)) else lower_roots
+    shown = sorted(p for p in o.keys() - b.keys() - a.keys() if p in names)
+    if shown:
+        return f"mixed: shows hidden lower names {shown[:3]}"
+    changed = [f"{p} {t}" for p in sorted(b.keys() & a.keys()) if b[p] == a[p]
+               for t in [_copyup_trace(b[p], o[p], ut)] if t not in (None, "copyup")]
+    if changed:
+        return f"mixed: changed {changed[:3]}"
+    return "between"
+
+
+def fault_summary(path):
+    """One line from the fault sweep's result lines (overlayfs_guest.sh
+    fault-sweep): COUNTS, number bad, number fired, 1 if the sweep
+    finished, the steps the time budget left out, and the detail, tab
+    separated, "-" for an empty field.  COUNTS gives every class of view after the next mount, so
+    the copy-up traces stay visible."""
+    cases = fired = 0
+    bad, silent, budget, classes, done = [], [], [], {}, 0
+    with open(path, errors="replace") as fh:
+        for line in fh.read().splitlines():
+            f = line.split("\t")
+            if f[0] == "# done":
+                done = 1
+            elif f[0] == "budget" and len(f) == 3:
+                budget.append(f"{f[1]}:{f[2]}")
+            elif len(f) == 8:
+                scen, k, _, mode, n, outcome, _, fire = f
+                cases += 1
+                fired += bool(fire)
+                if outcome.startswith("bad:"):
+                    bad.append(f"{scen} step {k} {mode}:{n}: {outcome}")
+                elif outcome.startswith("ok "):
+                    c = outcome.split("remount=")[1].split(" ")[0]
+                    classes[c] = classes.get(c, 0) + 1
+                elif n == "1":
+                    silent.append(f"{scen}:{k}:{mode}")
+    counts = f"{cases} cases, {fired} fired, {len(bad)} bad" + "".join(
+        f", {c} {classes[c]}" for c in sorted(classes))
+    detail = "; ".join(bad[:5] + ([f"never fired at N=1: {' '.join(silent)}"] if silent else []))
+    print("\t".join((counts, str(len(bad)), str(fired), str(done), " ".join(budget) or "-", detail or "-")))
+    return 0
+
+
+def lower_paths(roots):
+    """Every path in the lower layers ROOTS, relative to its layer."""
+    out = set()
+    for r in roots:
+        paths, _ = walk(r)
+        out.update(p for p in paths if p != ".")
+    return out
 
 
 def fault_selftest(root):
-    """Hand-made states for view_class: the two whole states must be
-    accepted and every half-done state of a rename over an existing name
-    and of a copy-up must be called mixed."""
+    """view_class on hand-made states: the whole states and the traces an
+    interrupted copy-up leaves must be accepted, and a lost name, a shown
+    lower name, changed data, a changed mode, a changed file mtime, a
+    directory mtime with no utimens fault, and every half-done state of a
+    rename over an existing name must be called mixed."""
     shutil.rmtree(root, ignore_errors=True)
     os.makedirs(root)
     tree = os.path.join(root, "t")
-
-    def state(fn, out):
-        shutil.rmtree(tree, ignore_errors=True)
-        os.makedirs(tree)
-        for n, data in (("src", "S"), ("dst", "D"), ("keep", "K")):
-            with open(os.path.join(tree, n), "w") as fh:
-                fh.write(data)
-        fn()
-        with open(out, "w") as fh:
-            for line in op_manifest(tree, "."):
-                fh.write(f"00\tM\t{line}\n")
-        return out
     p = lambda n: os.path.join(tree, n)
-    before = state(lambda: None, os.path.join(root, "before"))
-    after = state(lambda: os.rename(p("src"), p("dst")), os.path.join(root, "after"))
-    half = [
-        ("both names, source copied", lambda: shutil.copy(p("src"), p("dst"))),
-        ("neither name", lambda: (os.unlink(p("src")), os.unlink(p("dst")))),
-        ("target removed only", lambda: os.unlink(p("dst"))),
-        ("a bystander lost", lambda: (os.rename(p("src"), p("dst")), os.unlink(p("keep")))),
-        ("torn data", lambda: (os.unlink(p("src")), open(p("dst"), "w").write(""))),
+
+    def state(fn, out, edit=None):
+        shutil.rmtree(tree, ignore_errors=True)
+        os.makedirs(os.path.join(tree, "dir", "sub"))
+        for n, data in (("src", "S"), ("dst", "D"), ("keep", "K"), ("dir/f", "F")):
+            with open(p(n), "w") as fh:
+                fh.write(data)
+        os.link(p("keep"), p("keep-link"))
+        os.utime(p("dir"), (L.T_DIR, L.T_DIR))
+        os.utime(p("keep"), (L.T_MID, L.T_MID))
+        fn()
+        lines = [f"00\tM\t{line}" for line in op_manifest(tree, ".")]
+        if edit:
+            lines = [edit(x) for x in lines]
+        with open(out, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return out
+
+    def field(path, col, value):
+        def edit(line):
+            parts = line.split("\t")
+            if parts[2] == path:
+                parts[3 + col] = value
+            return "\t".join(parts)
+        return edit
+    nop = lambda: None
+    ren = lambda: os.rename(p("src"), p("dst"))
+    before = state(nop, os.path.join(root, "before"))
+    after = state(ren, os.path.join(root, "after"))
+    cases = [
+        # label, judge, fired, want, fn, edit
+        ("whole before", "atomic", "", "before", nop, None),
+        ("whole after", "atomic", "", "after", ren, None),
+        ("a directory copied up: st_nlink 1", "atomic", "", "before+copyup", nop, field("dir", NLINK, "1")),
+        ("a hard link copied up: st_nlink 1", "atomic", "", "before+copyup", nop, field("keep", NLINK, "1")),
+        ("after, a directory copied up", "atomic", "", "after+copyup", ren, field("dir", NLINK, "1")),
+        ("st_nlink 3", "atomic", "", "mixed", nop, field("keep", NLINK, "3")),
+        ("a directory's time new, utimens fault", "atomic", "fired: fail at layer mutation 7 (file_utimens)",
+         "before+copyup", nop, field("dir", MTIME, "new")),
+        ("a directory's time new, no utimens fault", "atomic", "fired: fail at layer mutation 7 (dir_mkdir)",
+         "mixed", nop, field("dir", MTIME, "new")),
+        ("a file's time new, utimens fault", "atomic", "fired: fail at layer mutation 7 (file_utimens)",
+         "mixed", nop, field("keep", MTIME, "new")),
+        ("a mode changed", "atomic", "", "mixed", lambda: os.chmod(p("keep"), 0o600), None),
+        ("data changed, same size and time", "atomic", "", "mixed",
+         lambda: (open(p("keep"), "w").write("X"), os.utime(p("keep"), (L.T_MID, L.T_MID))), None),
+        ("a name lost", "atomic", "", "mixed", lambda: os.unlink(p("dir/f")), None),
+        ("a hidden lower name shown", "atomic", "", "mixed", lambda: open(p("gone"), "w").write("G"), None),
+        ("both names, source copied", "atomic", "", "mixed", lambda: shutil.copy(p("src"), p("dst")), None),
+        ("neither name", "atomic", "", "mixed", lambda: (os.unlink(p("src")), os.unlink(p("dst"))), None),
+        ("target removed only", "atomic", "", "mixed", lambda: os.unlink(p("dst")), None),
+        ("a bystander lost", "atomic", "", "mixed", lambda: (ren(), os.unlink(p("keep"))), None),
+        ("torn data", "atomic", "", "mixed", lambda: (os.unlink(p("src")), open(p("dst"), "w").write("")), None),
+        ("compound: both names", "compound", "", "between", lambda: shutil.copy(p("src"), p("dst")), None),
+        ("compound: a new temporary name", "compound", "", "between", lambda: open(p("dst.tmp"), "w").write(""), None),
+        ("compound: a name both keep lost", "compound", "", "mixed", lambda: os.unlink(p("keep")), None),
+        ("compound: a hidden lower name shown", "compound", "", "mixed", lambda: open(p("gone"), "w").write("G"), None),
+        ("compound: a bystander's data changed", "compound", "", "mixed",
+         lambda: open(p("dir/f"), "w").write("X"), None),
+        ("compound: a bystander copied up", "compound", "", "before+copyup", nop, field("dir", NLINK, "1")),
     ]
     bad = []
-    for label, want, fn in [("whole before", "before", lambda: None),
-                            ("whole after", "after", lambda: os.rename(p("src"), p("dst")))] + \
-            [(lab, "mixed", fn) for lab, fn in half]:
-        got = view_class(before, after, state(fn, os.path.join(root, "observed")))
+    for label, judge, fired, want, fn, edit in cases:
+        got = view_class(before, after, state(fn, os.path.join(root, "observed"), edit), judge, fired,
+                         lower_roots={"gone", "src", "dst", "keep"})
         print(f"fault-selftest: {label}: {got}")
-        if got != want:
+        if got.split(":")[0].split(" (")[0] != want:
             bad.append(label)
     print("fault-selftest: ok" if not bad else f"fault-selftest: wrong for {bad}")
     return 1 if bad else 0
@@ -1140,9 +1324,13 @@ def main(argv):
         return 0
     if cmd == "mutating" and len(argv) == 3:
         return mutating(argv[2])
-    if cmd == "view-class" and len(argv) == 5:
-        print(view_class(argv[2], argv[3], argv[4]))
+    if cmd == "view-class" and len(argv) >= 5:
+        lowers = argv[argv.index("--lowers") + 1:] if "--lowers" in argv else []
+        print(view_class(argv[2], argv[3], argv[4], _opt(argv, "--judge") or "atomic",
+                         _opt(argv, "--fired") or "", lowers))
         return 0
+    if cmd == "fault-summary" and len(argv) == 3:
+        return fault_summary(argv[2])
     if cmd == "fault-selftest" and len(argv) == 3:
         return fault_selftest(argv[2])
     print(__doc__, file=sys.stderr)

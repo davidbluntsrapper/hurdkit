@@ -7,11 +7,14 @@
 #                                             /root/ovl/KEY; mount squashfs
 #                                             and tmpfs layers; snapshot the
 #                                             lowers
-#   overlayfs_guest.sh mount KEY [VAR=VALUE...]
+#   overlayfs_guest.sh mount KEY [--bin FILE] [VAR=VALUE...]
 #                                             settrans -a KEY/mnt $BIN
-#                                             --lowerdir=..., with the
-#                                             variables in the
+#                                             (or FILE) --lowerdir=...,
+#                                             with the variables in the
 #                                             translator's environment
+#   overlayfs_guest.sh reset KEY              empty the upper and work of
+#                                             KEY again, as prepare left
+#                                             them; the lowers stay
 #   overlayfs_guest.sh unmount KEY            settrans -gR, then check that
 #                                             no translator process is left
 #   overlayfs_guest.sh lowers-unchanged KEY   snapshot again and compare
@@ -22,6 +25,10 @@
 #                                             mount-args: set it up, start
 #                                             the translator, print what
 #                                             happened, tear it down
+#   overlayfs_guest.sh fault-sweep SET SECS SCENARIO[:K,K...]...
+#                                             the fault sweep (see the
+#                                             comment there); one result
+#                                             line per case on stdout
 #
 # The translator is /tmp/ovl-translator (a copy of OVERLAYFS_BIN, or the
 # adapter for another invocation).  Every step is idempotent: prepare
@@ -82,6 +89,7 @@ prepare)
     args="--lowerdir=$lowers"
     [[ $mode == rw ]] && args+=" --upperdir=$upper --workdir=$work"
     echo "$args" > "$d/args"
+    echo "$set" > "$d/set"
     echo "$upper" > "$d/upper-path"
     echo "$work" > "$d/work-path"
     mkdir "$d/mnt"
@@ -100,16 +108,21 @@ lowers-unchanged)
     bash "$0" snapshot "$2" > "$d.after"
     cmp -s "$d.before" "$d.after" || { diff "$d.before" "$d.after" | head -20; exit 1; }
     ;;
+reset)
+    d=$R/$2 upper=$(cat "$R/$2/upper-path") work=$(cat "$R/$2/work-path")
+    rm -rf "$upper" "$work" && $LAYERS build-upper "$(cat "$d/set")" "$upper" --convention hurd && mkdir "$work"
+    ;;
 mount)
     key=$2 d=$R/$2; shift 2
     bin=$BIN
+    if [[ ${1:-} == --bin ]]; then bin=$2; shift 2; fi
     # settrans -a does not hand its environment to the translator
     # (measured: a translator script saw OVERLAYFS_FAULT empty), so the
     # variables reach it through a wrapper that is the translator.
     if [[ $# -gt 0 ]]; then
+        printf '#!/bin/sh\nexec env %s %s "$@"\n' "$*" "$bin" > "$d/env-wrapper"
+        chmod 755 "$d/env-wrapper"
         bin=$d/env-wrapper
-        printf '#!/bin/sh\nexec env %s %s "$@"\n' "$*" "$BIN" > "$bin"
-        chmod 755 "$bin"
     fi
     # shellcheck disable=SC2046
     settrans -a "$d/mnt" "$bin" $(cat "$d/args") </dev/null >"$d/mnt.log" 2>&1
@@ -201,8 +214,100 @@ arg-case)
     teardown "$key"
     printf '%s\t%s\t%s\n' "$name" "$must" "$res"
     ;;
+fault-sweep)
+    # The whole sweep runs here, so a case costs no ssh.  SET is prepared
+    # once: the lowers are only read, and every case checks them.  For
+    # each mutating step K of each SCENARIO (or the steps listed), the
+    # views before and after K come from the real translator.  Then for
+    # MODE fail and exit and N = 1, 2, ... until the fault does not fire:
+    # empty the upper and work, replay steps 0..K-1 on the real
+    # translator, run K on the fault build with OVERLAYFS_FAULT=MODE:N,
+    # take the view there in fail mode (in exit mode the translator is
+    # gone and the mount point bare), mount the real translator again and
+    # take the view.  One line per case:
+    #   SCENARIO K JUDGE MODE N OUTCOME SECONDS FIRED
+    # "budget SCENARIO K" for each step not begun within SECS seconds (0:
+    # no limit), and "# done" at the end.
+    set=$2 secs=$3; shift 3
+    key=fault d=$R/fault W=$T/fault-sweep OPS="python3 $T/overlayfs_ops.py"
+    max=${FAULT_MAX:-200} end=$(( secs > 0 ? $(date +%s) + secs : 1 << 62 ))
+    rm -rf "$W"; mkdir -p "$W"
+    fresh() {
+        bash "$0" prepare "$set" rw $key > "$W/prepare.log" 2>&1 || return 1
+        lowers=()
+        for l in "$d"/l[0-9]*; do [[ -d $l ]] && lowers+=("$l"); done
+    }
+    # Upper and work as they are before step K, unmounted.
+    state() {
+        bash "$0" reset $key || return 1
+        [[ $K == 0 ]] && return 0
+        bash "$0" mount $key >/dev/null || return 1
+        $OPS run "$scen" $d/mnt --steps 0:$K >/dev/null
+        bash "$0" unmount $key >/dev/null
+    }
+    classify() { $OPS view-class "$W/before.log" "$W/after.log" "$1" --judge "$judge" --fired "$fired" --lowers "${lowers[@]}"; }
+    one_case() {
+        local fm=$1 n=$2 v1=- v2 left lc=0
+        fired=; : > "$W/fired"
+        state || { echo "bad: the steps before $K failed on the real translator"; return; }
+        if ! bash "$0" mount $key --bin $T/ovl-fault OVERLAYFS_FAULT=$fm:$n > "$W/mount.log" 2>&1; then
+            echo "bad: the fault build did not mount: $(tr '\n' ' ' < "$W/mount.log" | cut -c1-200)"; return
+        fi
+        if [[ $fm == fail ]]; then
+            $OPS run "$scen" $d/mnt --steps $K:$((K + 1)) --final-manifest > "$W/observed.log" 2>&1
+        else
+            $OPS run "$scen" $d/mnt --steps $K:$((K + 1)) > /dev/null 2>&1
+        fi
+        fired=$(grep -o 'OVERLAYFS_FAULT fired.*' $d/mnt.log | head -1)
+        echo "$fired" > "$W/fired"
+        if [[ $fm == exit && -n $fired ]]; then
+            settrans -fg $d/mnt >/dev/null 2>&1
+        else
+            bash "$0" unmount $key >/dev/null 2>&1 || settrans -fg $d/mnt >/dev/null 2>&1
+        fi
+        if ! bash "$0" mount $key > "$W/remount.mount" 2>&1; then
+            echo "bad: the next mount failed: $(tr '\n' ' ' < "$W/remount.mount" | cut -c1-200)"; return
+        fi
+        $OPS run persist $d/mnt --steps 0:0 --final-manifest > "$W/remount.log" 2>&1
+        bash "$0" unmount $key >/dev/null 2>&1 || { echo "bad: the real translator did not unmount after the next mount"; return; }
+        left=$(find "$(cat $d/work-path)" -mindepth 1 ! -type d 2>/dev/null | head -3 | tr '\n' ' ')
+        bash "$0" lowers-unchanged $key > "$W/lowers.diff" 2>&1 || lc=1
+        [[ $fm == fail ]] && v1=$(classify "$W/observed.log")
+        v2=$(classify "$W/remount.log")
+        if [[ $lc == 1 ]]; then echo "bad: a lower changed: $(head -3 "$W/lowers.diff" | tr '\n' ' ')"; fresh
+        elif [[ $v2 == mixed* ]]; then echo "bad: after the next mount: $v2"
+        elif [[ $v1 == mixed* ]]; then echo "bad: during: $v1"
+        elif [[ -n $left ]]; then echo "bad: the work directory holds $left"
+        elif [[ -z $fired ]]; then echo "notfired (view $v2)"
+        else echo "ok during=$v1 remount=$v2"; fi
+    }
+    fresh || { echo "bad: prepare: $(tail -3 "$W/prepare.log" | tr '\n' ' ')"; exit 1; }
+    for spec; do
+        scen=${spec%%:*} spec=${spec//,/ }
+        steps=$($OPS mutating "$scen")
+        if [[ $spec == *:* ]]; then
+            steps=$(for k in ${spec#*:}; do echo "$steps" | awk -F'\t' -v k="$k" '$1 == k'; done)
+        fi
+        while IFS=$'\t' read -r K judge; do
+            if (( $(date +%s) >= end )); then printf 'budget\t%s\t%s\n' "$scen" "$K"; continue; fi
+            state && bash "$0" mount $key >/dev/null \
+                && $OPS run "$scen" $d/mnt --steps $K:$K --final-manifest > "$W/before.log" 2>&1 \
+                && $OPS run "$scen" $d/mnt --steps $K:$((K + 1)) --final-manifest > "$W/after.log" 2>&1
+            bash "$0" unmount $key >/dev/null 2>&1
+            for fm in fail exit; do
+                for ((n = 1; n <= max; n++)); do
+                    t0=$(date +%s)
+                    r=$(one_case $fm $n)
+                    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$scen" "$K" "$judge" "$fm" "$n" "$r" $(( $(date +%s) - t0 )) "$(cat "$W/fired")"
+                    [[ $r == notfired* ]] && break
+                done
+            done
+        done <<< "$steps"
+    done
+    echo "# done"
+    ;;
 *)
-    sed -n '2,25p' "$0" >&2
+    sed -n '2,35p' "$0" >&2
     exit 2
     ;;
 esac
