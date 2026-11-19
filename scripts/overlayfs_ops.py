@@ -832,7 +832,11 @@ def ids(root):
             try:
                 st = os.lstat(full)
                 seen[p] = st.st_ino
-                dev.add(st.st_dev)
+                # lstat of a fifo is answered by the translator the
+                # filesystem starts on it, with that translator's st_dev;
+                # plain ext2fs does the same.
+                if not stat.S_ISFIFO(st.st_mode):
+                    dev.add(st.st_dev)
                 if stat.S_ISDIR(st.st_mode):
                     d = Dir(full)
                     try:
