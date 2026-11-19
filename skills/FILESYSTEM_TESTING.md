@@ -447,7 +447,9 @@ runs the oracle and the control, then fails with
 | `SQUASHFS_BIN` | `~/src/squashfs/squashfs.static` | The squashfs translator that serves the squashfs lowers |
 | `STAGES` | `1 2` | `1`: the read-only sets with no upper. `2`: the writable sets, which run all of stage 1 again |
 | `STRESS_SECS` | `60` | Length of `stress-ro` and `stress-rw` |
-| `FAULT_SCENARIOS`, `FAULT_SET`, `FAULT_STEPS`, `FAULT_MAX` | all write scenarios, `ext2-2`, every mutating step, 200 | Scope of the fault sweep |
+| `FAULT_SCENARIOS` | see [The fault sweep](#the-fault-sweep) | Steps the fault sweep covers: `SCENARIO` (every mutating step) or `SCENARIO:K,K` (those steps), space separated |
+| `FAULT_SET`, `FAULT_MAX` | `ext2-2`, 200 | The set the sweep runs on; the largest N per step and mode |
+| `FAULT_BUDGET` | `2700` | Seconds after which the sweep begins no further step; a step it leaves out fails the check. `0`: no limit |
 | `ORACLE_ONLY` | `0` | `1`: build the binaries, record the Linux logs, stop |
 | `PLAN` | `.` | Script only: run the control and the translator only on plan rows whose `SET.MODE.SCENARIO` matches this `grep -E` pattern. For debugging; a filtered run is not an acceptance run |
 
@@ -506,6 +508,16 @@ and a 5,000-entry directory.
 | A whiteout Linux lists in a lower-only directory but cannot stat | strict (plain and translator) | Linux reads such a directory by passthrough (D9); the translator must hide it |
 | Unlink in a sticky directory gives `EACCES` | hurd | `libfshelp/perms-checkdirmod.c` |
 | A sparse copy-up on a tmpfs upper is filled | hurd+tmpfs-upper | The Hurd's tmpfs stores no holes |
+| A directory's mtime is not compared | hurd+tmpfs-upper | The Hurd's tmpfs never updates a directory's mtime when an entry is added or removed (measured on a bare tmpfs, no overlay) |
+| `truncate both 3` of `copyup` is not run; `open both WRONLY` runs instead, and `both` is no longer compared | hurd+tmpfs-upper | A shrinking truncate to a non-zero size on the Hurd's tmpfs panics gnumach (`vm_map_copyin_page_list: Assertion 'm->wire_count == 1'`), with no overlay involved. The run prints `SKIPPED` for it, during the run and again above the summary |
+
+A field a tag never compares (the `st_nlink` and mtime rows) is printed
+as an allowed difference for each manifest line where it hides one. A
+step a tag does not run carries an `instead` entry in
+`overlayfs_ops.py` and is recorded as `skipped (WHY); ran STEP: RESULT`;
+`compare` accepts that record only for the tags the entry names, and
+`compare persist --after SCENARIO` keeps ignoring the paths the scenario
+stopped comparing.
 
 Records normalise what the two systems cannot share: an mtime that is
 not one of the description's fixed times prints `new`, and symlink
@@ -532,6 +544,7 @@ Each scenario check is reported per run, as `CHECK: SET.MODE.SCENARIO`.
 | `ops-copyup`, `ops-remove`, `ops-rename`, `ops-create`, `copy-up-attrs`, `open-across-copy-up`, `perms`, `enospc` | 2 | The write scenarios agree with Linux |
 | `upper-state`, `persist` | 2 | The upper means what Linux's means; after a remount the manifest is Linux's and the work directory holds no files |
 | `reserved`, `stress-rw` | 2 | `.wh..wh..opq` cannot be created or listed; 8 writers for `STRESS_SECS`, then every listed name stats and the overlay unmounts |
+| `raw-names` | 2 | Directory RPCs that no libc call sends, with a name that is not one path component (`a/b`, `../x`, `/x`, empty, `.`, `..`) in `dir_mkdir`, `dir_rmdir`, `dir_unlink`, `dir_rename`, `dir_link` and a symlink's `dir_link`, sent by uid 1000 with `scripts/overlayfs_raw.c`, are refused with `EINVAL`. The overlay keeps taking writes, the directory and a closed sibling are unchanged, and no stray name appears in upper or work. The upper is a scratch ext2 image with its own ext2fs, so that a failure stays inside the test; do not point `overlayfs_raw` at an overlay whose upper is on the guest's root filesystem |
 | `hostile` | 2 | Each layout of `overlayfs_ops.py mount-args` marked `survive` is refused or served without a hang or crash, printed beside Linux's result |
 | `fault-sweep` | 2 | See below |
 
@@ -543,21 +556,99 @@ its environment fails the Nth layer mutation, and `exit:N` exits there.
 It prints a line containing `OVERLAYFS_FAULT fired` on stderr when it
 injects. `settrans -a` does not pass its environment to the translator
 (measured: a translator script started with `env OVERLAYFS_FAULT=fail:7
-settrans -a ...` saw the variable empty), so `overlayfs_guest.sh mount`
-starts a wrapper script that sets the variables and execs the binary. For each mutating step of each write scenario, and N from 1
-until a run where it does not fire, the sweep runs the steps before it on
-the real translator, the step on the fault build, and a manifest. It
-then remounts the real translator. Both views must equal the view before
-the step or the view after it (`overlayfs_ops.py view-class`), the
-lowers must be unchanged, and the next mount must work.
-`overlayfs_ops.py fault-selftest DIR` proves `view-class` on states made
-by hand. The sweep fails when no case fired at all, and its message lists
-each step where N=1 did not fire.
+settrans -a ...` saw the variable empty), so `overlayfs_guest.sh mount
+KEY --bin FILE VAR=VALUE` starts a wrapper script that sets the
+variables and execs the binary.
+
+The sweep runs inside the guest in one ssh session
+(`overlayfs_guest.sh fault-sweep`), and each case's result line comes
+back as it ends, into `fault/results.tsv`. `FAULT_SET` is prepared once.
+The translator only reads the lowers, and every case checks that they
+are unchanged. For each step K that `overlayfs_ops.py mutating` lists:
+
+1. The views before and after K come from the real translator.
+2. For each mode, `fail` and then `exit`, and N = 1, 2, ... until a case
+   in which the fault does not fire (at most `FAULT_MAX`): the upper and
+   work directories are emptied again (`overlayfs_guest.sh reset`),
+   steps 0 to K-1 run on the real translator, and step K runs on the
+   fault build. In `fail` mode the view is taken there. In `exit` mode
+   it is not, because the translator has exited and the mount point
+   shows the bare directory underneath.
+3. The real translator mounts again and the view is taken.
+
+A case is bad when the next mount fails, a lower changed, the work
+directory still holds a file, or a view is `mixed`. `overlayfs_ops.py
+view-class` names the view. How it judges a step is data, the table
+`FAULT_JUDGE` in `overlayfs_ops.py`, by op:
+
+| Judge | Ops | The view must be |
+|---|---|---|
+| atomic | every op that makes one visible change, maybe after an invisible copy-up (`open`, `append`, `truncate`, `chmod`, `chown`, `utime`, `unlink`, `rmdir`, `mkdir`, `rename`, `symlink`, `link`, `mkfifo`, `mknod`, `open-across-copy-up`) | `before` or `after`, exactly or up to copy-up traces |
+| compound | `write` (create, then fill), `editor-save` (write a temporary, then rename), `rmtree` (one unlink per entry) | as for atomic, or `between`: every name that both the before and the after view have is still there, each such entry that is the same in both is unchanged (up to copy-up traces), and no name of a lower that both views hide is visible |
+
+A failed or interrupted operation may leave its parent chain or its
+source copied up. Linux does not undo a copy-up either. Such a view is
+`before+copyup` or `after+copyup`, and the class names each path and
+field it tolerated. Only these differences are tolerated:
+
+- `st_nlink` of a directory or regular file becomes 1. A lower-only
+  directory that is copied up becomes a merged directory, which reports
+  1 (I6). A copied-up name of a lower hard link reports 1 while its other
+  name keeps the lower count (H4).
+- A directory's mtime reads `new`, and only when the fault hit a
+  `file_utimens`. The translator sets a copied-up directory's own times
+  after the rename that puts it in place, and restores its parent's
+  times after that. Both calls are best effort, as Linux's restore of
+  the parent's times is (`txn_exec.c` `ST_SET_TIMES` and
+  `ST_RESTORE_TIMES`), so a fault there leaves the time that the rename
+  gave.
+
+Names, types, data, mode, owner and file mtimes never differ in a
+copy-up trace. `overlayfs_ops.py fault-selftest DIR` proves `view-class`
+on states made by hand: the whole states and both kinds of trace are
+accepted, and a lost name, a shown lower name, changed data, a changed
+mode, a changed file mtime, a directory mtime without a `file_utimens`
+fault, a link count other than 1, and every half-done state of a rename
+over an existing name are `mixed`.
+
+The check line counts the cases, the cases that fired, the bad ones and
+each class of view after the next mount, so the copy-up traces stay
+visible. The check fails when a case is bad, when no case fired (the
+sweep tested nothing), when the guest session did not end, or when
+`FAULT_BUDGET` ran out before the last step. Its message lists each step
+where N=1 did not fire, which is expected for a step that fails before
+it changes a layer (`EEXIST`, say).
+
+A case costs about 4 seconds: two views of the 5,059-path tree at about
+1.6 s each, the lowers' snapshot at 0.7 s, and the mounts, replays and
+unmounts. Measured phase by phase, the old sweep, which ran each guest
+command over ssh and built the layers again for each case, cost about
+14 s a case, and rebuilding the layers (3.5 to 4.6 s) was its largest
+part.
+
+The whole sweep, every mutating step of `copyup`, `remove`, `rename` and
+`create`, is 1,926 cases and took 2 hours 10 minutes, about 30 minutes of
+it in `rmtree many` (5,000 unlinks, cut at `FAULT_MAX`). Run it with:
+
+```sh
+make overlayfs-test FAULT_SCENARIOS="copyup remove rename create" FAULT_BUDGET=0
+```
+
+The default sweeps 21 steps, one for each kind of change the whole sweep
+showed, so the sweep of a default run takes about 40 minutes:
+
+| Scenario | Steps | What they change |
+|---|---|---|
+| `copyup` | 0, 2, 6, 18, 27, 30 | open of a lower file for writing (copy-up with data), a new file (`write`, compound), open with `O_TRUNC` (an empty copy), append under a chain of lower directories, `utime` of the sparse 8 MiB file, `lchown` of a symlink |
+| `remove` | 0, 4, 8, 14, 22, 25 | unlink of a lower file (whiteout), of an upper file, of a file in a directory both lowers have, rmdir of a merged directory, mkdir where a whiteout is (opaque), `rmtree` of a merged tree (compound) |
+| `rename` | 0, 3, 16, 20, 28 | a lower file, a lower file into a lower-only directory, a lower file over a lower file under a chain, an upper directory, `editor-save` (compound) |
+| `create` | 0, 3, 8, 12 | symlink, hard link of a lower file, fifo, `mknod c 0 0` (refused) |
+
 
 To drive the sweep's loop without a fault build, point
 `OVERLAYFS_FAULT_BIN` at a script that prints the marker for some N and
-execs `/tmp/ovl-translator.real` (the real translator during the sweep),
-and narrow it with `FAULT_SCENARIOS=create FAULT_STEPS="0 3"`.
+execs `/tmp/ovl-translator` (the real translator), and narrow it with
+`FAULT_SCENARIOS=create:0,3`.
 
 ### Proving the harness
 
@@ -574,6 +665,18 @@ must fail `readdir`, `symlink` and `manifest`.
   under `/tmp/ovl`; the `perms` scenario runs as uid 1000.
 - `stat` of a fifo starts `/hurd/fifo` on it, so unmounts use
   `settrans -gR` with retries.
+- `overlayfs_guest.sh unmount` looks for a translator left running by
+  program name. Matching the key's path alone also matched the caller's
+  own `bash -c` line whenever that line named the mount point, and the
+  unmount then failed.
+- On the guest's `/hurd/tmpfs`, a shrinking truncate to a non-zero size
+  panics gnumach and the guest reboots: write 35 bytes, `ftruncate(fd,
+  3)`. Truncating to 0 and growing work. Try anything like it on a
+  throwaway guest only.
+- The guest's `/hurd/tmpfs` never updates a directory's mtime when an
+  entry is added or removed; ext2fs does.
+- `PLAN` reaches awk through `ENVIRON`, because `awk -v` treats
+  backslashes as escapes and would turn `\.` into `.`.
 
 ## Gotchas
 
