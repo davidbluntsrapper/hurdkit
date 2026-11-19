@@ -113,7 +113,7 @@ LOCK_FILE     := $(IMG_DIR)/.build.lock
 .PHONY: virtio-bench-image virtio-bench-vnet-image virtio-bench
 .PHONY: run-smp-tests run-up-tests smp-image up-image
 .PHONY: virtio-clean gnumach-clean
-.PHONY: fs-translators exfatfs exfatfs-clean
+.PHONY: fs-translators exfatfs exfatfs-clean exfatfs-test
 
 # The default builds the whole image pipeline, with every intermediate
 # exposed as its own qcow2 (see the stage rules below).
@@ -413,6 +413,23 @@ virtio-net-test: virtio-net $(TEST_IMG)
 		VIRTIO_DIR="$(VIRTIO_NET_DIR)" MODE="$(MODE)" \
 		BASE_IMG="$(abspath $(TEST_IMG))" \
 		bash scripts/virtio_net_test.sh
+
+# Build fatfs from HURD_TREE and exfatfs from EXFATFS_DIR, boot the guest and run the
+# filesystem matrix: each image mounted with its translator in the guest
+# and compared with the Linux kernel driver's view of it, then exFAT
+# writes, checked by fsck.exfat and a Linux readback (see
+# scripts/exfatfs_test.sh and skills/FILESYSTEM_TESTING.md).  Needs sudo
+# for loop mounts.  FS=fat runs only the fatfs control.  A failed run
+# leaves its guest running; REUSE=1 reruns the checks against it.
+exfatfs-test: $(if $(FS_IN_TREE),fs-translators) $(if $(filter exfat,$(FS)),exfatfs) $(TEST_IMG)
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		SSH_KEY_DIR="$(abspath $(SSH_KEY_DIR))" \
+		BASE_IMG="$(abspath $(TEST_IMG))" \
+		TRANSLATOR_DIR="$(BUILD)/hurd-translators" \
+		EXFATFS_STATIC="$(abspath $(EXFATFS_DIR))/exfatfs.static" \
+		FS="$(FS)" EXFAT_WRITE="$(EXFAT_WRITE)" \
+		bash scripts/exfatfs_test.sh
 
 # Build a guest image whose primary network interface is virtio-net (replacing
 # e1000): stages the virtio-net binary and a matching /etc/network/interfaces
