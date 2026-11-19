@@ -25,6 +25,9 @@
 #                                             mount-args: set it up, start
 #                                             the translator, print what
 #                                             happened, tear it down
+#   overlayfs_guest.sh raw-names              directory RPCs whose name is
+#                                             not one path component are
+#                                             refused (scratch upper)
 #   overlayfs_guest.sh fault-sweep SET SECS SCENARIO[:K,K...]...
 #                                             the fault sweep (see the
 #                                             comment there); one result
@@ -214,6 +217,71 @@ arg-case)
     teardown "$key"
     printf '%s\t%s\t%s\n' "$name" "$must" "$res"
     ;;
+raw-names)
+    # Directory RPCs whose name is not one path component ("a/b", "..",
+    # "", ...), sent by uid 1000 with overlayfs_raw through a writable
+    # overlay, must be refused with EINVAL and change nothing.  The upper
+    # and work are on a scratch ext2 image with its own ext2fs, so that a
+    # failure stays inside the test.  One PASS or FAIL line per case.
+    d=$R/raw M=$R/raw/mnt U=$R/raw/fs RAW=$T/overlayfs_raw fails=0
+    user=$(getent passwd 1000 | cut -d: -f1)
+    settrans -gR "$M" 2>/dev/null; settrans -gfR "$U" 2>/dev/null; rm -rf "$d"
+    mkdir -p "$d/lo/open/lsub" "$d/lo/closed" "$M" "$U"
+    dd if=/dev/zero of="$d/fs.img" bs=1M count=48 2>/dev/null
+    mke2fs -q -F -o hurd "$d/fs.img" >/dev/null 2>&1
+    start "$U" "$d/fs.log" /hurd/ext2fs "$d/fs.img" >/dev/null || { echo "FAIL the scratch ext2fs did not start"; exit 1; }
+    mkdir "$U/up" "$U/wk"
+    echo secret > "$d/lo/closed/secret"; echo l > "$d/lo/open/lf"
+    chmod 777 "$d/lo/open"; chmod 700 "$d/lo/closed"; chown 1000:1000 "$d/lo/open/lsub" "$d/lo/open/lf"
+    start "$M" "$d/m.log" $BIN --lowerdir="$d/lo" --upperdir="$U/up" --workdir="$U/wk" >/dev/null \
+        || { echo "FAIL the overlay did not mount: $(cat "$d/m.log")"; exit 1; }
+    # From /: uid 1000 cannot reach root's working directory.
+    as_user() { (cd / && su -s /bin/sh "$user" -c "$1" 2>&1); }
+    as_user "mkdir $M/open/sub && echo f > $M/open/f"
+    alive() {
+        timeout 10 ls "$U/up" >/dev/null 2>&1 || { echo "FAIL $1: the upper filesystem no longer answers"; return 1; }
+        [[ $(as_user "timeout 10 mkdir $M/open/probe && rmdir $M/open/probe && echo ok") == ok ]] \
+            || { echo "FAIL $1: the overlay no longer takes a write"; return 1; }
+    }
+    O=$M/open
+    while read -r want args; do
+        want=${want//_/ }
+        eval "set -- $args"
+        label="$*"; label=${label//$M/MNT}
+        out=$(as_user "timeout 20 $RAW $(printf "'%s' " "$@")"); out=${out#*: }
+        if [[ $out == "$want" ]] && alive "$label"; then echo "PASS $label: $out"
+        else echo "FAIL $label: '$out', want '$want'"; fails=$((fails + 1)); fi
+    done <<CASES
+Invalid_argument mkdir $O aaa/bbb
+Invalid_argument mkdir $O ../closed/newdir
+Invalid_argument mkdir $O /abs
+Invalid_argument mkdir $O ''
+Invalid_argument mkdir $O .
+Invalid_argument mkdir $O ..
+Invalid_argument rmdir $O ../open/sub
+Invalid_argument rmdir $O sub/.
+Invalid_argument unlink $O ../closed/secret
+Invalid_argument rename $O ../closed/secret $O got
+Invalid_argument rename $O f $O ../closed/planted
+Invalid_argument rename $O f $O ''
+Invalid_argument rename $O sub $O aaa/bbb
+Invalid_argument link $O $O/f ../closed/l
+Invalid_argument link $O $O/lf aaa/bbb
+Invalid_argument symlink $O target ../closed/sl
+Invalid_argument mkfile-link $O ../closed/x
+ok symlink $O ../../a/b//c/ goodlink
+CASES
+    check() { if eval "$2"; then echo "PASS $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
+    check "a refused link copied nothing up" '[[ ! -e $U/up/open/lf ]]'
+    check "a symlink target that holds a slash is kept" '[[ $(readlink $O/goodlink) == ../../a/b//c/ ]]'
+    check "the directory holds what it held" '[[ $(ls $O | tr "\n" " ") == "f goodlink lf lsub sub " ]]'
+    check "nothing reached the closed directory" '[[ $(ls -A $d/lo/closed | tr "\n" " ") == "secret " && ! -e $U/up/closed ]]'
+    check "no stray name in upper or work" '[[ -z $(find $U/up $U/wk -name aaa -o -name bbb -o -name planted -o -name newdir) ]]'
+    check "the overlay unmounts" 'timeout 20 settrans -gR $M'
+    settrans -gfR "$U" 2>/dev/null
+    echo "raw-names: $fails failed"
+    [[ $fails == 0 ]]
+    ;;
 fault-sweep)
     # The whole sweep runs here, so a case costs no ssh.  SET is prepared
     # once: the lowers are only read, and every case checks them.  For
@@ -307,7 +375,7 @@ fault-sweep)
     echo "# done"
     ;;
 *)
-    sed -n '2,35p' "$0" >&2
+    sed -n '2,38p' "$0" >&2
     exit 2
     ;;
 esac

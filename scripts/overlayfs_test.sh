@@ -102,6 +102,9 @@ printf '#include <stdio.h>\nconst char *ovl_hello (void);\nint main (void) { ret
     > "$WORK/src/main.c"
 "$CROSS_CC" -shared -fPIC -o "$WORK/bin/libovlhello.so" "$WORK/src/lib.c"
 "$CROSS_CC" -o "$WORK/bin/dynhello" "$WORK/src/main.c" -L"$WORK/bin" -lovlhello
+# Not in bin/: every file there becomes part of the lowest layer.
+"$CROSS_CC" -static -O2 -o "$WORK/overlayfs_raw" "$SCRIPT_DIR/overlayfs_raw.c" 2> "$WORK/src/build-raw.log" \
+    || { cat "$WORK/src/build-raw.log" >&2; exit 1; }
 
 echo "$FT_NAME: recording Linux overlayfs on this host ($(uname -r))"
 bash "$SCRIPT_DIR/overlayfs_linux_oracle.sh" "$WORK" "$WORK/bin" > "$WORK/oracle.log" 2>&1 \
@@ -124,7 +127,7 @@ tar -C "$WORK/bin" -cf "$WORK/bin.tar" .
 tar -C "$LX/img" -cf "$WORK/img.tar" .
 cp "$SQUASHFS_BIN" "$WORK/squashfs.static"
 if ! { put "$LAYERS" "$OPS" "$SCRIPT_DIR/overlayfs_guest.sh" "$SCRIPT_DIR/fs_image_test.py" \
-           "$WORK/bin.tar" "$WORK/img.tar" "$WORK/squashfs.static" \
+           "$WORK/bin.tar" "$WORK/img.tar" "$WORK/squashfs.static" "$WORK/overlayfs_raw" \
        && g "rm -rf $G/ovl-bin $G/ovl-img && mkdir -p $G/ovl-bin $G/ovl-img /tmp/ovl \
              && tar -C $G/ovl-bin -xf $G/bin.tar && tar -C $G/ovl-img -xf $G/img.tar \
              && python3 -c 'import ctypes'"; }; then
@@ -366,6 +369,13 @@ except OSError as e: print(e.strerror)' $M/\$p; done; ls -a $M $M/d | grep -c 'w
         done
     fi
     g "$GH teardown $key" >/dev/null 2>&1 || true
+
+    t0=$SECONDS
+    rc=0; out=$(g "$GH raw-names" 2>&1) || rc=$?
+    echo "$out" > "$WORK/guest/raw-names.log"
+    check_result "raw-names: a name that is not one path component is refused, and nothing changes" "$rc" \
+        $((SECONDS - t0)) "$(echo "$out" | grep -v '^PASS' | head -6 | tr '\n' ' ' | cut -c1-400)"
+    g "settrans -gfR /tmp/ovl/raw/mnt; settrans -gfR /tmp/ovl/raw/fs; rm -rf /tmp/ovl/raw" >/dev/null 2>&1 || true
 
     # The fault sweep runs in the guest in one session (overlayfs_guest.sh
     # fault-sweep), so a case costs no ssh; each case's line comes back as
