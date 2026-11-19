@@ -7,7 +7,9 @@ Hurd tree, or `exfatfs` or `squashfs` in its own repo) and need to prove
 that it reads and writes images the way Linux does. Also use it when you
 add a filesystem to the test. `make exfatfs-test` covers fatfs and exfatfs.
 `make squashfs-test` covers squashfs and is described in
-[The squashfs test](#the-squashfs-test).
+[The squashfs test](#the-squashfs-test). `make overlayfs-test` covers the
+overlayfs union translator and is described in
+[The overlayfs test](#the-overlayfs-test).
 
 ## Run the test
 
@@ -406,6 +408,172 @@ calls the library. To move to a new release, change the `*_VER` and
 - The guest's Python has no `os.listxattr`, so the guest side of the
   xattr check uses `fs_probe xattrs` (glibc's `llistxattr` and
   `lgetxattr`).
+
+## The overlayfs test
+
+`make overlayfs-test` checks the overlayfs translator, a libnetfs union
+of one writable upper directory over read-only lower directories, against
+Linux overlayfs in its default configuration (the host kernel, 7.0 when
+the test was written). It was written before the translator, as its
+acceptance contract (`.audit/overlayfs-test-brief.md` in the workspace).
+
+### Run it
+
+```sh
+make overlayfs-test OVERLAYFS_DIR=~/src/overlayfs SQUASHFS_DIR=~/src/squashfs
+make overlayfs-test STAGES=1                   # the read-only stage only
+make overlayfs-test REUSE=1                    # rerun against a failed run's guest
+make overlayfs-oracle                          # record the Linux logs only
+```
+
+The test starts the translator as
+
+```sh
+settrans -a MNT $OVERLAYFS_BIN --lowerdir=L1:L2 [--upperdir=U --workdir=W]
+```
+
+with the leftmost lower topmost, as Linux orders them. No `--upperdir`
+means a read-only overlay. `make overlayfs-test` builds the translator
+only when `OVERLAYFS_DIR` holds a checkout. Without a binary the test
+runs the oracle and the control, then fails with
+`translator: ... does not exist`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OVERLAYFS_DIR` | `~/src/overlayfs` | Checkout of the overlayfs repo |
+| `OVERLAYFS_BIN` | `~/src/overlayfs/overlayfs.static` | Script only: the binary used as the translator |
+| `OVERLAYFS_FAULT_BIN` | `OVERLAYFS_DIR/overlayfs-fault.static` | The fault build for the fault sweep |
+| `OVERLAYFS_ADAPTER` | empty | Script only: `unionfs` runs upstream unionfs (`UNIONFS_BIN`) through an adapter that turns the options into unionfs's arguments. This is the stage-1 red run |
+| `SQUASHFS_BIN` | `~/src/squashfs/squashfs.static` | The squashfs translator that serves the squashfs lowers |
+| `STAGES` | `1 2` | `1`: the read-only sets with no upper. `2`: the writable sets, which run all of stage 1 again |
+| `STRESS_SECS` | `60` | Length of `stress-ro` and `stress-rw` |
+| `FAULT_SCENARIOS`, `FAULT_SET`, `FAULT_STEPS`, `FAULT_MAX` | all write scenarios, `ext2-2`, every mutating step, 200 | Scope of the fault sweep |
+| `ORACLE_ONLY` | `0` | `1`: build the binaries, record the Linux logs, stop |
+| `PLAN` | `.` | Script only: run the control and the translator only on plan rows whose `SET.MODE.SCENARIO` matches this `grep -E` pattern. For debugging; a filtered run is not an acceptance run |
+
+The work files stay in `img/tmp/overlayfs-test/`: `linux/` (the Linux
+logs, one per run, with `.persist.log`, `.upper`, `.work` and
+`.lowers-ok` beside them, the squashfs images in `img/`, and
+`mount-args.txt`), `control/` (the plain-directory logs and their
+comparisons), `guest/` (the translator's logs, comparisons and upper
+states), `fault/` and `times.tsv` (every check with its result and
+seconds).
+
+### The oracles and the control
+
+`scripts/overlayfs_layers.py` describes the layer sets once and builds
+them on both sides. `scripts/overlayfs_ops.py` holds the scenarios as
+data, runs one against a directory, and prints one record per step.
+
+| Set | Lowers | Upper | Purpose |
+|---|---|---|---|
+| `ext2-1` | one ext2 directory | ext2 | base case |
+| `ext2-2` | two | ext2 | file over file, dir over dir, file over dir, dir over file |
+| `sq-1` | a squashfs image | ext2 | the main use |
+| `sq-tmp` | a squashfs image | tmpfs | live-system shape |
+| `ro` | two | none | read-only overlay |
+| `pre` | one | an upper with whiteouts, an opaque directory and copied-up files, in each system's convention | reading existing state |
+| `wh-lower` | three: whiteouts and an opaque directory in the middle, whiteouts in the lowest | ext2 | Linux's rules for lower whiteouts |
+| `enospc` | one | a 1 MiB tmpfs | a copy-up that does not fit |
+
+The lowest layer holds every object kind the brief lists: empty, small,
+300 KiB, 2 MiB and sparse 8 MiB files, a static and a dynamic Hurd binary
+with its library, nested directories, four kinds of symlink, a hard-link
+pair, a fifo, a socket, char and block devices, setuid, setgid, sticky
+and 0000 modes, owners 0 and 1000, old and 2038 mtimes, a 255-byte name
+and a 5,000-entry directory.
+
+1. **Linux.** `scripts/overlayfs_linux_oracle.sh` runs every row of
+   `overlayfs_ops.py plan` against `sudo mount -t overlay` on the host,
+   on every run, so the logs always come from the running kernel.
+   Opaque directories carry `trusted.overlay.opaque=y` there.
+2. **A plain directory.** The guest builds the merged view of each set
+   from the description (`overlayfs_layers.py merged`), runs the same
+   scenario on it, and compares with Linux. It shares no code with
+   either overlay. A step may list the result a tag gives instead of
+   Linux's, with the reason, and `compare` prints every difference it
+   allowed. This run is the **control**: the translator is judged only
+   after every control run passes.
+
+| Difference | Tag | Why |
+|---|---|---|
+| A copied-up hard link breaks; `st_nlink` of the other name stays the lower's | plain | No index in the default configuration (Linux H2, H4) |
+| A directory that exists in a lower is renamed | plain | Linux gives `EXDEV` (redirect_dir off); the next step renames it back |
+| `mknod c 0 0` | plain | Linux refuses the whiteout's device number with `EPERM` |
+| An `mmap` made before copy-up sees a later write | plain | Linux keeps it on the lower file (F3) |
+| `st_nlink` of directories | plain | Linux gives 1 for a merged directory (I6) |
+| `statfs` relation to the upper | plain | No upper |
+| A whiteout Linux lists in a lower-only directory but cannot stat | strict (plain and translator) | Linux reads such a directory by passthrough (D9); the translator must hide it |
+| Unlink in a sticky directory gives `EACCES` | hurd | `libfshelp/perms-checkdirmod.c` |
+| A sparse copy-up on a tmpfs upper is filled | hurd+tmpfs-upper | The Hurd's tmpfs stores no holes |
+
+Records normalise what the two systems cannot share: an mtime that is
+not one of the description's fixed times prints `new`, and symlink
+permission bits are not compared (the Hurd applies the umask to them).
+Inode numbers and `st_dev` are never compared with Linux. The upper is
+compared by meaning (`overlayfs_ops.py upper-state`): whiteouts as char
+0:0 at the same paths, and a directory opaque in one exactly when it is
+in the other, by xattr on Linux and by a `.wh..wh..opq` entry on the Hurd.
+
+### What the overlayfs test checks
+
+Each scenario check is reported per run, as `CHECK: SET.MODE.SCENARIO`.
+
+| Check | Stage | What must hold |
+|---|---|---|
+| `oracle: Linux leaves every lower unchanged` | host | Every Linux run leaves each lower identical (content, mode, owner, mtime, ctime) |
+| `control: ...` | both | The plain-directory run agrees with Linux, up to the listed differences |
+| `manifest`, `lookup`, `readdir`, `getcwd`, `read`, `symlink`, `special`, `statfs` | 1 | The steps of scenario `read` agree with Linux: the merged manifest; every path by name and `..` of every directory; whiteout and opaque names `ENOENT`; readdir with `.` and `..`, no duplicates, rewind, `telldir`/`seekdir`, the 5,000 entries; `getcwd` at depth 3 in lower-only, merged and upper-only directories; checksums, `pread`, reads past the end; `readlink`, following, `lstat`; fifo, socket and device nodes; `f_namemax`, `ST_RDONLY` and whether the blocks are the upper's |
+| `erofs` | 1 | Every mutating call, and a writable shared `mmap`, gives what Linux gives with no upper |
+| `unmount`, `lower-untouched` | both | `settrans -gR` works and leaves no translator process; each lower is unchanged (snapshot for ext2, image checksum for squashfs) |
+| `mmap-exec`, `ids`, `stress-ro` | 1 | On set `ro`: a static and a dynamic binary run from the overlay and `mmap` reads what `read` reads; `st_ino` unique (one hard-link pair) and stable over two walks, one `st_dev`, `d_ino` equal to `st_ino`; 8 processes for `STRESS_SECS` with no error |
+| `layer-dies` | 1 | The squashfs translator under `sq-1`'s lower is killed: reads give errors within 30 s and the overlay unmounts |
+| `mount-args` | 1 | Missing `--lowerdir`, a lower that is not a directory, one lower twice and 501 lowers are refused with a message |
+| `ops-copyup`, `ops-remove`, `ops-rename`, `ops-create`, `copy-up-attrs`, `open-across-copy-up`, `perms`, `enospc` | 2 | The write scenarios agree with Linux |
+| `upper-state`, `persist` | 2 | The upper means what Linux's means; after a remount the manifest is Linux's and the work directory holds no files |
+| `reserved`, `stress-rw` | 2 | `.wh..wh..opq` cannot be created or listed; 8 writers for `STRESS_SECS`, then every listed name stats and the overlay unmounts |
+| `hostile` | 2 | Each layout of `overlayfs_ops.py mount-args` marked `survive` is refused or served without a hang or crash, printed beside Linux's result |
+| `fault-sweep` | 2 | See below |
+
+### The fault sweep
+
+The fault build is a second binary from the translator's sources with
+one hook in the module that changes layers. `OVERLAYFS_FAULT=fail:N` in
+its environment fails the Nth layer mutation, and `exit:N` exits there.
+It prints a line containing `OVERLAYFS_FAULT fired` on stderr when it
+injects. `settrans -a` does not pass its environment to the translator
+(measured: a translator script started with `env OVERLAYFS_FAULT=fail:7
+settrans -a ...` saw the variable empty), so `overlayfs_guest.sh mount`
+starts a wrapper script that sets the variables and execs the binary. For each mutating step of each write scenario, and N from 1
+until a run where it does not fire, the sweep runs the steps before it on
+the real translator, the step on the fault build, and a manifest. It
+then remounts the real translator. Both views must equal the view before
+the step or the view after it (`overlayfs_ops.py view-class`), the
+lowers must be unchanged, and the next mount must work.
+`overlayfs_ops.py fault-selftest DIR` proves `view-class` on states made
+by hand. The sweep fails when no case fired at all, and its message lists
+each step where N=1 did not fire.
+
+To drive the sweep's loop without a fault build, point
+`OVERLAYFS_FAULT_BIN` at a script that prints the marker for some N and
+execs `/tmp/ovl-translator.real` (the real translator during the sweep),
+and narrow it with `FAULT_SCENARIOS=create FAULT_STEPS="0 3"`.
+
+### Proving the harness
+
+Upstream unionfs (built static from `hurd/unionfs`) through
+`OVERLAYFS_ADAPTER=unionfs` with `STAGES=1` is the stage-1 red run. It
+must fail `readdir`, `symlink` and `manifest`.
+
+### overlayfs gotchas
+
+- `cp -a` on the Hurd cannot copy a socket (`EINVAL`), so the guest
+  rebuilds the plain directory from the description for each scenario
+  instead of copying it.
+- The guest's `/root` is not reachable by uid 1000, so the guest works
+  under `/tmp/ovl`; the `perms` scenario runs as uid 1000.
+- `stat` of a fifo starts `/hurd/fifo` on it, so unmounts use
+  `settrans -gR` with retries.
 
 ## Gotchas
 

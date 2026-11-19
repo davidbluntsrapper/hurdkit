@@ -44,6 +44,9 @@ FAULT_MAX="${FAULT_MAX:-200}"
 FAULT_SCENARIOS="${FAULT_SCENARIOS:-copyup remove rename create}"
 FAULT_SET="${FAULT_SET:-ext2-2}"
 FAULT_STEPS="${FAULT_STEPS:-}"
+# Only the plan's runs whose SET.MODE.SCENARIO matches PLAN (a grep -E
+# pattern), for debugging; a filtered run is not an acceptance run.
+PLAN="${PLAN:-.}"
 REUSE="${REUSE:-0}"
 GUEST_TIMEOUT="${GUEST_TIMEOUT:-600}"
 BASE_IMG="${BASE_IMG:-$REPO_ROOT/img/hurd.packages.qcow2}"
@@ -147,7 +150,7 @@ while IFS=$'\t' read -r set mode scen _stage plain; do
     check_result "control: $key agrees with Linux, up to the listed differences" "$rc" $((SECONDS - t0)) \
         "$(grep -v 'allowed\|^check' "$WORK/control/$key.cmp" 2>/dev/null | head -8 | tr '\n\t' '  ')"
     [[ $rc == 0 ]] || ctl_fail=1
-done < <(python3 "$OPS" plan)
+done < <(python3 "$OPS" plan | awk -F'\t' -v p="$PLAN" '($1 "." $2 "." $3) ~ p')
 g "rm -rf /tmp/ovl/plain" || true
 if [[ $ctl_fail == 1 ]]; then
     fail "translator: not judged, the control failed"
@@ -260,7 +263,7 @@ while IFS=$'\t' read -r set mode scen _ _; do
     if [[ $mode == ro ]]; then stage 1 || continue; else stage 2 || continue; fi
     echo "$FT_NAME: $set.$mode.$scen"
     judge_run "$set" "$mode" "$scen"
-done < <(python3 "$OPS" plan)
+done < <(python3 "$OPS" plan | awk -F'\t' -v p="$PLAN" '($1 "." $2 "." $3) ~ p')
 
 # The checks that read one mounted overlay rather than compare a log.
 if stage 1; then
@@ -402,6 +405,8 @@ except OSError as e: print(e.strerror)' $M/\$p; done; ls -a $M $M/d | grep -c 'w
         put "$WORK/ovl-fault"
         bad=()
         cases=0
+        fired=0
+        silent=()
         for scen in $FAULT_SCENARIOS; do
             for k in ${FAULT_STEPS:-$(python3 "$OPS" mutating "$scen")}; do
                 # The two whole states: before STEP and after it, on the
@@ -416,13 +421,18 @@ except OSError as e: print(e.strerror)' $M/\$p; done; ls -a $M $M/d | grep -c 'w
                         r=$(fault_case "$scen" "$k" "$fm" "$n")
                         printf '%s\t%s\t%s\t%s\t%s\n' "$scen" "$k" "$fm" "$n" "$r" >> "$WORK/fault/results.tsv"
                         [[ $r == bad:* ]] && bad+=("$scen step $k $fm:$n: $r")
+                        [[ $r == ok-* ]] && fired=$((fired + 1))
+                        [[ $r == notfired && $n == 1 ]] && silent+=("$scen:$k:$fm")
                         [[ $r == notfired || $r == bad:* ]] && break
                     done
                 done
             done
         done
-        check_result "fault-sweep: fail and exit at every layer mutation of every scenario step ($cases cases)" \
-            "$([[ ${#bad[@]} == 0 && $cases -gt 0 ]]; echo $?)" $((SECONDS - t0)) "${bad[*]:0:5}"
+        # A step that fails before it changes a layer (EEXIST, say) never
+        # fires, but a sweep in which nothing fires tested nothing.
+        check_result "fault-sweep: fail and exit at every layer mutation of every scenario step ($cases cases, $fired fired)" \
+            "$([[ ${#bad[@]} == 0 && $fired -gt 0 ]]; echo $?)" $((SECONDS - t0)) \
+            "${bad[*]:0:5}${silent[0]+; never fired at N=1: ${silent[*]:0:20}}"
     fi
 fi
 finish

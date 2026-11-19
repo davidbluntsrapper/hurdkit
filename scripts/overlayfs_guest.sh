@@ -9,8 +9,9 @@
 #                                             lowers
 #   overlayfs_guest.sh mount KEY [VAR=VALUE...]
 #                                             settrans -a KEY/mnt $BIN
-#                                             --lowerdir=... with the
-#                                             environment given
+#                                             --lowerdir=..., with the
+#                                             variables in the
+#                                             translator's environment
 #   overlayfs_guest.sh unmount KEY            settrans -gR, then check that
 #                                             no translator process is left
 #   overlayfs_guest.sh lowers-unchanged KEY   snapshot again and compare
@@ -101,8 +102,17 @@ lowers-unchanged)
     ;;
 mount)
     key=$2 d=$R/$2; shift 2
+    bin=$BIN
+    # settrans -a does not hand its environment to the translator
+    # (measured: a translator script saw OVERLAYFS_FAULT empty), so the
+    # variables reach it through a wrapper that is the translator.
+    if [[ $# -gt 0 ]]; then
+        bin=$d/env-wrapper
+        printf '#!/bin/sh\nexec env %s %s "$@"\n' "$*" "$BIN" > "$bin"
+        chmod 755 "$bin"
+    fi
     # shellcheck disable=SC2046
-    env "$@" settrans -a "$d/mnt" $BIN $(cat "$d/args") </dev/null >"$d/mnt.log" 2>&1
+    settrans -a "$d/mnt" "$bin" $(cat "$d/args") </dev/null >"$d/mnt.log" 2>&1
     rc=$?
     cat "$d/mnt.log"
     exit $rc
