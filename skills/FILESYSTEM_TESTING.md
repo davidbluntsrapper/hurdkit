@@ -415,7 +415,7 @@ calls the library. To move to a new release, change the `*_VER` and
 of one writable upper directory over read-only lower directories, against
 Linux overlayfs in its default configuration (the host kernel, 7.0 when
 the test was written). It was written before the translator, as its
-acceptance contract (`.audit/overlayfs-test-brief.md` in the workspace).
+acceptance contract.
 
 ### Run it
 
