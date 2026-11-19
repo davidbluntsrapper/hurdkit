@@ -25,7 +25,7 @@ SSH_PORT ?= 2222
 BINUTILS_VER := 2.46.1
 GCC_VER      := 15.3.0
 
-.PHONY: all toolchain toolchain-clean fetch compress-libs zlib xz zstd lz4 lzo binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp libdiskfs libnetfs storeio fs-translators exfatfs squashfs virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
+.PHONY: all toolchain toolchain-clean fetch compress-libs zlib xz zstd lz4 lzo binutils gcc1 gnumach gnumach-kernel glibc gcc2 mig hurd hurd-headers libpciaccess libtrivfs libirqhelp libdiskfs libnetfs storeio fs-translators exfatfs squashfs overlayfs virtio-9p virtio-balloon virtio-blk virtio-net 9pfs verify-vm clean tooldir 3p-pin glibc-rebuild
 
 # The verified 3p checkouts, pinned to exact SHAs (see
 # stuff/crosscompile_plan.md, "3p source pins"). The shared 3p checkout is
@@ -697,6 +697,17 @@ squashfs: hurd mig compress-libs libdiskfs
 	    WITH_GZIP=yes WITH_XZ=yes WITH_ZSTD=yes WITH_LZ4=yes WITH_LZO=yes
 	@echo "=== gate: squashfs ==="
 	$(call hurd-elf-gate,$(SQUASHFS_DIR)/squashfs.static)
+
+# The overlayfs translator lives in its own repo, a libnetfs translator
+# built like squashfs.  OVERLAYFS_DIR selects the checkout, and the
+# harness takes overlayfs.static from it.
+OVERLAYFS_DIR ?= $(HOME)/src/overlayfs
+
+overlayfs: hurd mig libnetfs
+	$(MAKE) -C $(OVERLAYFS_DIR) clean
+	$(MAKE) -C $(OVERLAYFS_DIR) HURD_PREFIX=$(PREFIX)
+	@echo "=== gate: overlayfs ==="
+	$(call hurd-elf-gate,$(OVERLAYFS_DIR)/overlayfs.static)
 
 # 9pfs calls two RPC stubs directly: exec_exec_paths (file-exec-paths.c,
 # from libhurduser) and mach_port_move_member (io-reauthenticate.c, from

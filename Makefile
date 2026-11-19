@@ -77,6 +77,11 @@ VIRTIO_9P_BIN := $(VIRTIO_DIR)/virtio-9p
 EXFATFS_DIR   ?= $(HOME)/src/exfatfs
 # The standalone repo of the squashfs translator.
 SQUASHFS_DIR  ?= $(HOME)/src/squashfs
+# The standalone repo of the overlayfs translator.  The test takes
+# overlayfs.static from it, and the fault build (fault sweep) from
+# OVERLAYFS_FAULT_BIN.
+OVERLAYFS_DIR ?= $(HOME)/src/overlayfs
+OVERLAYFS_FAULT_BIN ?= $(abspath $(OVERLAYFS_DIR))/overlayfs-fault.static
 # The gnumach source checkout used for the kernel build. Override this to
 # build a worktree instead of the pinned 3p checkout.
 GNUMACH_DIR   ?= 3p/gnumach
@@ -112,7 +117,8 @@ LOCK_FILE     := $(IMG_DIR)/.build.lock
 	virtio-net-image virtio-net-connectivity-test \
 	virtio-bench-image virtio-bench-vnet-image \
 	run-smp-tests run-up-tests virtio-bench virtio-bench-image storeio \
-	fs-translators exfatfs exfatfs-test squashfs squashfs-test compress-libs
+	fs-translators exfatfs exfatfs-test squashfs squashfs-test compress-libs \
+	overlayfs overlayfs-test overlayfs-oracle
 
 # The default builds the whole image pipeline, with every intermediate
 # exposed as its own qcow2 (see the stage rules below).
@@ -349,6 +355,7 @@ fs-translators: fetch-3p ; $(MAKE) -C toolchain fs-translators \
 	HURD_TREE=$(abspath $(HURD_TREE)) FS_TRANSLATORS="$(addsuffix fs,$(FS_IN_TREE))"
 exfatfs: fetch-3p ; $(MAKE) -C toolchain exfatfs EXFATFS_DIR=$(abspath $(EXFATFS_DIR))
 squashfs: fetch-3p ; $(MAKE) -C toolchain squashfs SQUASHFS_DIR=$(abspath $(SQUASHFS_DIR))
+overlayfs: fetch-3p ; $(MAKE) -C toolchain overlayfs OVERLAYFS_DIR=$(abspath $(OVERLAYFS_DIR))
 
 # Boot the guest with a host directory shared through QEMU's virtio-9p
 # device and run the translator test matrix: the device selftest, the
@@ -436,6 +443,36 @@ squashfs-test: squashfs $(TEST_IMG)
 		SQUASHFS_BIN="$(abspath $(SQUASHFS_DIR))/squashfs.static" \
 		FUZZ_SEED="$(FUZZ_SEED)" FUZZ_COUNT="$(FUZZ_COUNT)" \
 		bash scripts/squashfs_test.sh
+
+# Build the overlayfs translator from OVERLAYFS_DIR when that checkout
+# exists, boot the guest and run the overlayfs test: every scenario of
+# scripts/overlayfs_ops.py on the layer sets of scripts/overlayfs_layers.py,
+# compared with Linux overlayfs on this host (recorded afresh by
+# scripts/overlayfs_linux_oracle.sh, sudo) after a plain-directory
+# control passes (see scripts/overlayfs_test.sh and
+# skills/FILESYSTEM_TESTING.md).  Without a translator the test fails
+# after the control, naming the missing binary.  STAGES="1" runs the
+# read-only stage alone.  A failed run leaves its guest running; REUSE=1
+# reruns the checks against it.
+overlayfs-test: $(if $(wildcard $(OVERLAYFS_DIR)/Makefile),overlayfs) squashfs $(TEST_IMG)
+	$(MKDIR_P) $(TMP_DIR)
+	SSH_HOST="$(SSH_HOST)" SSH_PORT="$(SSH_PORT)" REUSE="$(REUSE)" \
+		SSH_KEY_DIR="$(abspath $(SSH_KEY_DIR))" \
+		BASE_IMG="$(abspath $(TEST_IMG))" TMP_DIR="$(abspath $(TMP_DIR))" \
+		OVERLAYFS_BIN="$(abspath $(OVERLAYFS_DIR))/overlayfs.static" \
+		OVERLAYFS_FAULT_BIN="$(OVERLAYFS_FAULT_BIN)" \
+		SQUASHFS_BIN="$(abspath $(SQUASHFS_DIR))/squashfs.static" \
+		STAGES="$(STAGES)" \
+		bash scripts/overlayfs_test.sh
+
+# Record the Linux side of the overlayfs test alone, into
+# $(TMP_DIR)/overlayfs-test/linux (needs sudo and the cross compiler).
+overlayfs-oracle:
+	$(MKDIR_P) $(TMP_DIR)
+	ORACLE_ONLY=1 TMP_DIR="$(abspath $(TMP_DIR))" \
+		BASE_IMG="$(abspath $(TEST_IMG))" SSH_KEY_DIR="$(abspath $(SSH_KEY_DIR))" \
+		SQUASHFS_BIN="$(abspath $(SQUASHFS_DIR))/squashfs.static" \
+		bash scripts/overlayfs_test.sh
 
 # Build a guest image whose primary network interface is virtio-net (replacing
 # e1000): stages the virtio-net binary and a matching /etc/network/interfaces

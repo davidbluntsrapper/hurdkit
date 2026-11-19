@@ -11,15 +11,19 @@ directory, so the record format cannot drift between them.
   overlayfs_ops.py mount-args
         print the bad invocations and hostile layouts: name, must, setup,
         options, during (see MOUNT_ARGS)
-  overlayfs_ops.py run SCENARIO ROOT [--upper DIR]
+  overlayfs_ops.py run SCENARIO ROOT [--upper DIR] [--steps A:B] [--final-manifest]
         run SCENARIO against ROOT (a mount point or a plain directory) and
         print one record per step.  --upper names the overlay's upper
-        directory, for the statfs step
+        directory, for the statfs step.  --steps runs steps A to B-1 only;
+        --final-manifest adds a manifest of ROOT as step 99
   overlayfs_ops.py compare SCENARIO LINUX_LOG OTHER_LOG --tags T1,T2 [--set SET]
         compare a log with the Linux log of the same scenario and set,
         allowing exactly the per-step differences the scenario lists for
-        the tags (plain: the plain-directory control; hurd: anything in
-        the guest).  Exit 1 on any other difference
+        the tags (plain: the plain-directory control; overlay: the
+        translator; hurd: anything in the guest; strict: plain or
+        overlay, which hide what Linux lists but cannot stat;
+        tmpfs-upper).  Prints "check<TAB>NAME<TAB>pass|fail" for each of
+        the brief's checks the scenario covers.  Exit 1 on any difference
   overlayfs_ops.py upper-state UPPER --convention linux|hurd
         print the meaning of an upper directory: whiteouts, opaque
         directories, and every other entry with its type
@@ -28,6 +32,8 @@ directory, so the record format cannot drift between them.
   overlayfs_ops.py stress-ro ROOT SECS PROCS
   overlayfs_ops.py stress-rw ROOT SECS PROCS
         PROCS processes for SECS seconds; print counts and unexpected errors
+  overlayfs_ops.py checks SCENARIO
+        print the names of the brief's checks SCENARIO covers
   overlayfs_ops.py mutating SCENARIO
         print the index of each step that changes the tree (fault sweep)
   overlayfs_ops.py view-class BEFORE AFTER OBSERVED
@@ -60,12 +66,33 @@ import overlayfs_layers as L  # noqa: E402
 START = time.time()
 
 
-def S(op, *args, diff=None, ignore=None, why=""):
-    """A step.  DIFF {tag: result} is the result a system with that tag
-    gives instead of Linux's, IGNORE {tag: (path, ...)} the paths whose
+def S(op, *args, diff=None, ignore=None, why="", check=None):
+    """A step.  DIFF {tags: result} is the result a system with all of
+    TAGS ("plain", or "hurd+tmpfs-upper") gives instead of Linux's; None
+    allows any result.  IGNORE {tag: (path, ...)} names the paths whose
     manifest lines that system no longer compares from this step on, and
-    WHY the reason, which the compare output quotes."""
-    return {"op": op, "args": args, "diff": diff or {}, "ignore": ignore or {}, "why": why}
+    WHY the reason, which the compare output quotes.  CHECK names the
+    brief's check the step belongs to (default: by op, see CHECK_OF)."""
+    return {"op": op, "args": args, "diff": diff or {}, "ignore": ignore or {}, "why": why,
+            "check": check}
+
+
+# The brief's stage-1 check each read step belongs to.
+CHECK_OF = {
+    "manifest": "manifest", "lookup-all": "lookup", "stat-names": "lookup",
+    "readdir": "readdir", "readdir-seek": "readdir", "getcwd": "getcwd", "read": "read",
+    "pread": "read", "readlink": "symlink", "follow": "symlink", "open-fifo": "special",
+    "statfs": "statfs", "erofs": "erofs",
+}
+
+
+def check_of(scenario, step):
+    if step["check"]:
+        return step["check"]
+    sc = SCENARIOS[scenario]
+    if sc["stage"] == 1:
+        return CHECK_OF.get(step["op"], "read")
+    return sc.get("check", "ops-" + scenario)
 
 
 HL_BREAK = "Linux breaks a hard link at copy-up (no index); a plain directory keeps it"
@@ -91,8 +118,9 @@ READ_STEPS = [
     S("pread", "sparse", (8 << 20) - 50, 200), S("pread", "small", 1000, 10),
     S("readlink", "sl-rel"), S("readlink", "sl-abs"), S("readlink", "sl-dangling"),
     S("readlink", "sl-dir"), S("follow", "sl-rel"), S("follow", "sl-dir"),
-    S("follow", "sl-dangling"), S("stat", "sl-rel"), S("readlink", "small"),
-    S("stat", "fifo"), S("stat", "sock"), S("stat", "chr"), S("stat", "blk"),
+    S("follow", "sl-dangling"), S("stat", "sl-rel", check="symlink"), S("readlink", "small"),
+    S("stat", "fifo", check="special"), S("stat", "sock", check="special"),
+    S("stat", "chr", check="special"), S("stat", "blk", check="special"),
     S("open-fifo", "fifo"),
     S("stat", "hl-a"), S("stat", "hl-b"), S("stat", "setuid"), S("stat", "mode0"),
     S("statfs", diff={"plain": None}, why="a plain directory has no upper to compare statfs with"),
@@ -110,20 +138,23 @@ SCENARIOS = {
         S("chmod", "ro644", 0o600), S("stat", "ro644"),
         S("chown", "old", 1000, 1000), S("stat", "old"),
         S("utime", "future", 1000000000), S("stat", "future"),
-        S("utime", "setuid", 1500000000), S("stat", "setuid"),
+        S("utime", "setuid", 1500000000), S("stat", "setuid", check="copy-up-attrs"),
         S("append", "a/b/c/deep", "deeper\n"), S("stat", "a/b/c"), S("stat", "a/b"),
         S("stat", "a"), S("read", "a/b/c/deep"),
         S("append", "hl-a", "only through hl-a\n", ignore={"plain": ("hl-a", "hl-b")}, why=HL_BREAK),
         S("read", "hl-b", diff={"plain": None}, why=HL_BREAK),
         S("stat", "hl-a", diff={"plain": None}, why=HL_BREAK),
         S("stat", "hl-b", diff={"plain": None}, why=HL_BREAK),
-        S("utime", "sparse", 1500000000), S("holes", "sparse"), S("read", "sparse"),
+        S("utime", "sparse", 1500000000),
+        S("holes", "sparse", check="copy-up-attrs", diff={"hurd+tmpfs-upper": "ok filled"},
+          why="the Hurd's tmpfs stores no holes (measured, overlayfs-guest-capabilities.md 7)"),
+        S("read", "sparse", check="copy-up-attrs"),
         S("lchown", "sl-rel", 1000, 1000),
-        S("readlink", "sl-rel"), S("stat", "sl-rel"),
+        S("readlink", "sl-rel", check="copy-up-attrs"), S("stat", "sl-rel", check="copy-up-attrs"),
         S("chmod", "fifo", 0o600), S("stat", "fifo"), S("chmod", "chr", 0o600), S("stat", "chr"),
         S("open", "small", "WRONLY|CREAT|EXCL"), S("open", "brand-new", "WRONLY|CREAT|EXCL"),
         S("open", "empty", "WRONLY|APPEND"), S("append", "empty", "x"), S("read", "empty"),
-        S("open-across-copy-up", "d/low-only", diff={"plain": "ok fd=new mmap=new"}, why=MAP_COPYUP),
+        S("open-across-copy-up", "d/low-only", check="open-across-copy-up", diff={"plain": "ok fd=new mmap=new"}, why=MAP_COPYUP),
         S("manifest", "."),
     ]},
     "remove": {"stage": 2, "sets": "rw", "steps": [
@@ -179,18 +210,20 @@ SCENARIOS = {
         S("write", "m1/m2/m3/new", "new\n"), S("listdir", "m1/m2/m3"),
         S("manifest", "."),
     ]},
-    "perms": {"stage": 2, "sets": "rw", "user": 1000, "steps": [
+    "perms": {"stage": 2, "sets": "rw", "user": 1000, "check": "perms", "steps": [
         S("open", "ro644", "WRONLY"), S("open", "user/own", "WRONLY|APPEND"),
         S("append", "user/own", "by 1000\n"), S("read", "user/own"),
         S("write", "user/new", "new by 1000\n"), S("stat", "user/new"),
         S("write", "sticky/mine", "1000 in sticky\n"), S("stat", "sticky/mine"),
-        S("unlink", "sticky/root-file"), S("unlink", "sticky/user-file"),
+        S("unlink", "sticky/root-file", diff={"hurd": "EACCES"},
+          why="the Hurd's sticky-directory rule gives EACCES (libfshelp/perms-checkdirmod.c:41), Linux EPERM"),
+        S("unlink", "sticky/user-file"),
         S("unlink", "small"), S("read", "mode0"), S("chmod", "small", 0o666),
         S("rename", "user/own", "user/own2"), S("mkdir", "user/sub"), S("stat", "user/sub"),
         S("manifest", "user"), S("manifest", "sticky"),
     ]},
-    "persist": {"stage": 2, "sets": (), "steps": [S("manifest", ".")]},
-    "enospc": {"stage": 2, "sets": ("enospc",), "plain": False, "steps": [
+    "persist": {"stage": 2, "sets": (), "check": "persist", "steps": [S("manifest", ".")]},
+    "enospc": {"stage": 2, "sets": ("enospc",), "plain": False, "check": "enospc", "steps": [
         S("open", "big2m", "WRONLY"), S("read", "big2m"), S("listdir-upper"),
         S("append", "medium", "fits\n"), S("read", "medium"),
         S("manifest", "."),
@@ -224,7 +257,9 @@ def fields(path, st=None):
     st = st or os.lstat(path)
     t = L_type(st.st_mode)
     return "\t".join((
-        t, "%04o" % stat.S_IMODE(st.st_mode), f"{st.st_uid}:{st.st_gid}",
+        # A symlink's permission bits mean nothing; the Hurd applies the
+        # umask to them and Linux does not.
+        t, "%04o" % stat.S_IMODE(st.st_mode) if t != "l" else "-", f"{st.st_uid}:{st.st_gid}",
         str(st.st_size) if t != "d" else "-", str(st.st_nlink),
         norm_time(st.st_mtime) if t != "l" else "-",
         sha(path) if t == "f" and st.st_mode & 0o444 else "-",
@@ -602,14 +637,21 @@ def run_step(root, step, upper):
     return "ok" if r is None else r
 
 
-def run(name, root, upper=None):
+def run(name, root, upper=None, steps=None, final_manifest=False):
+    """STEPS (start, stop) runs only those steps (the fault sweep);
+    FINAL_MANIFEST adds a manifest of the whole tree as step 99."""
     sc = SCENARIOS[name]
     if sc.get("user"):
         os.setgroups([])
         os.setgid(sc["user"])
         os.setuid(sc["user"])
     os.umask(0o022)
-    for i, step in enumerate(sc["steps"]):
+    todo = list(enumerate(sc["steps"]))
+    if steps:
+        todo = todo[steps[0]:steps[1]]
+    if final_manifest:
+        todo.append((99, S("manifest", ".")))
+    for i, step in todo:
         label = " ".join([step["op"]] + [str(x) for x in step["args"]]).replace("\n", "\\n")
         if step["op"] == "manifest":
             try:
@@ -698,9 +740,12 @@ def compare(name, a_path, b_path, tags):
         return 1
     gign = [g for t in tags for g in GLOBAL_IGNORE.get(t, ())]
     hidden = _listed_unstatable(a) if "strict" in tags else set()
-    ignored = [p for t in tags for p in sc.get("ignore", {}).get(t, ())]
+    ignored = []
     bad = 0
+    verdict = {}
     for i, step in enumerate(sc["steps"]):
+        chk = check_of(name, step)
+        verdict.setdefault(chk, "pass")
         for t in tags:
             ignored += step["ignore"].get(t, ())
         la, lb = a.get(i, []), b.get(i, [])
@@ -714,12 +759,13 @@ def compare(name, a_path, b_path, tags):
             lb = [_blank_manifest_line(x, gign) for x in lb if x.startswith("M\t") and keep(x)]
             if la != lb:
                 bad += 1
+                verdict[chk] = "fail"
                 sa, sb = set(la), set(lb)
-                print(f"step {i:02d} manifest differs:")
+                print(f"[{chk}] step {i:02d} manifest differs:")
                 for x in sorted(sa - sb)[:30]:
-                    print(f"   linux: {x}")
+                    print(f"[{chk}]    linux: {x}")
                 for x in sorted(sb - sa)[:30]:
-                    print(f"   other: {x}")
+                    print(f"[{chk}]    other: {x}")
             continue
         # A record is LABEL<TAB>RESULT and a stat RESULT holds tabs itself.
         label, _, want = la[0].partition("\t") if la else (step["op"], "", "(missing)")
@@ -732,14 +778,17 @@ def compare(name, a_path, b_path, tags):
                 print(f"step {i:02d} {label}: allowed difference (Linux lists a whiteout that "
                       f"lookup hides, D9): linux {want}, other {got}")
                 continue
-        allowed = [step["diff"][t] for t in tags if t in step["diff"]]
+        allowed = [v for k, v in step["diff"].items() if all(t in tags for t in k.split("+"))]
         if got == want:
             continue
         if allowed and (allowed[0] is None or got == allowed[0]):
             print(f"step {i:02d} {label}: allowed difference ({step['why']}): linux {want}, other {got}")
             continue
         bad += 1
-        print(f"step {i:02d} {label}: linux {want} | other {got}")
+        verdict[chk] = "fail"
+        print(f"[{chk}] step {i:02d} {label}: linux {want} | other {got}")
+    for chk, v in verdict.items():
+        print(f"check\t{chk}\t{v}")
     print(f"compare: {name}: {'agrees' if not bad else f'{bad} steps differ'}")
     return 1 if bad else 0
 
@@ -780,19 +829,22 @@ def ids(root):
         paths, errs = walk(root)
         for p in paths:
             full = os.path.join(root, p)
-            st = os.lstat(full)
-            seen[p] = st.st_ino
-            dev.add(st.st_dev)
-            if stat.S_ISDIR(st.st_mode):
-                d = Dir(full)
-                try:
-                    for n, dino in d.read():
-                        if n in (".", ".."):
-                            continue
-                        if dino != os.lstat(os.path.join(full, n)).st_ino:
-                            dmis += 1
-                finally:
-                    d.close()
+            try:
+                st = os.lstat(full)
+                seen[p] = st.st_ino
+                dev.add(st.st_dev)
+                if stat.S_ISDIR(st.st_mode):
+                    d = Dir(full)
+                    try:
+                        for n, dino in d.read():
+                            if n in (".", ".."):
+                                continue
+                            if dino != os.lstat(os.path.join(full, n)).st_ino:
+                                dmis += 1
+                    finally:
+                        d.close()
+            except OSError as e:
+                errs.append(f"{p}: {ename(e)}")
         return seen, dev, dmis, errs
     s1, dev1, dmis, errs = one()
     s2, _, _, _ = one()
@@ -803,7 +855,7 @@ def ids(root):
     print(f"entries={len(s1)} distinct-ino={len(set(inos))} shared={dupl} "
           f"stable={'yes' if s1 == s2 else 'no'} devs={len(dev1)} dino-mismatch={dmis} "
           f"errors={len(errs)}")
-    return 0 if unique or dupl <= 1 else 1
+    return 0 if (unique or dupl <= 1) and not errs else 1
 
 
 def _stress(args):
@@ -1025,7 +1077,10 @@ def main(argv):
             print("\t".join(r) + f"\t{sc['stage']}\t{'plain' if sc.get('plain', True) else '-'}")
         return 0
     if cmd == "run" and len(argv) >= 4:
-        return run(argv[2], argv[3], _opt(argv, "--upper"))
+        steps = _opt(argv, "--steps")
+        return run(argv[2], argv[3], _opt(argv, "--upper"),
+                   tuple(int(x) for x in steps.split(":")) if steps else None,
+                   "--final-manifest" in argv)
     if cmd == "compare" and len(argv) >= 5:
         return compare(argv[2], argv[3], argv[4], (_opt(argv, "--tags") or "").split(","))
     if cmd == "upper-state" and len(argv) >= 3:
@@ -1035,6 +1090,10 @@ def main(argv):
         return ids(argv[2])
     if cmd in ("stress-ro", "stress-rw") and len(argv) == 5:
         return stress(argv[2], float(argv[3]), int(argv[4]), cmd == "stress-rw")
+    if cmd == "checks" and len(argv) == 3:
+        sc = SCENARIOS[argv[2]]["steps"]
+        print(" ".join(dict.fromkeys(check_of(argv[2], st) for st in sc)))
+        return 0
     if cmd == "mutating" and len(argv) == 3:
         return mutating(argv[2])
     if cmd == "view-class" and len(argv) == 5:
